@@ -26,6 +26,10 @@ export interface Vehicle {
   status: VehicleStatus
   custodian: string
   notes?: string
+  /** New assets become reportable starting in this month. Omitted for legacy assets. */
+  reportingStartPeriod?: string
+  /** Last month of required reporting after retirement (end-of-month assumption). */
+  retiredAfterPeriod?: string
 }
 
 export interface MonthlyReport {
@@ -45,6 +49,12 @@ export interface MonthlyReport {
   reviewedAt?: string
   reviewNote?: string
   revision: number
+  /** Immutable-at-submission directory attribution for review staging. */
+  departmentAtSubmission?: string
+  unitAtSubmission?: string
+  plateAtSubmission?: string
+  licensedAtSubmission?: boolean
+  attributionSource?: 'Recorded' | 'Legacy inferred'
 }
 
 export interface MaintenanceTicket {
@@ -77,6 +87,31 @@ export interface FollowUp {
   actor: string
   note: string
   at: string
+  /** Internal action tracking only. No email, SMS or reminder is sent. */
+  status?: 'Open' | 'Closed'
+  owner?: string
+  dueOn?: string
+  outcome?: string
+  closedAt?: string
+  closedBy?: string
+}
+/** Snapshots appended by domain transitions, never edited by app controls. */
+export interface ReportHistoryEntry {
+  id: string
+  reportId: string
+  revision: number
+  at: string
+  actor: string
+  action: 'Submitted' | 'Resubmitted' | 'Approved' | 'Returned' | 'Reopened for correction' | 'Imported snapshot'
+  snapshot: MonthlyReport
+}
+export interface TicketHistoryEntry {
+  id: string
+  ticketId: string
+  at: string
+  actor: string
+  action: string
+  snapshot: MaintenanceTicket
 }
 
 export interface AuditEntry {
@@ -97,6 +132,8 @@ export interface FleetState {
   audit: AuditEntry[]
   departmentProfiles: DepartmentProfile[]
   followUps: FollowUp[]
+  reportHistory: ReportHistoryEntry[]
+  ticketHistory: TicketHistoryEntry[]
 }
 
 export type ReportInput = Pick<MonthlyReport, 'vehicleId' | 'period' | 'startOdometer' | 'endOdometer' | 'fuelGallons' | 'fuelCost' | 'condition' | 'notes' | 'operator'>
@@ -115,6 +152,8 @@ export interface FleetException {
   dueDate?: string
   daysOverdue?: number
   lastFollowUpAt?: string
+  openFollowUpCount?: number
+  nextFollowUpDue?: string
 }
 
 export const FLEET_STORAGE_KEY = 'fleetsync-operations-demo-v1'
@@ -152,6 +191,14 @@ function daysAfter(date: string, now = new Date()): number {
   const midnight = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate())
   return Math.floor((midnight - Date.UTC(year, month - 1, day)) / 86400000)
 }
+function validDay(value: string, field: string): string {
+  const day = String(value ?? '').trim()
+  const parsed = new Date(day + 'T12:00:00')
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !Number.isFinite(parsed.getTime()) || localDay(parsed) !== day) {
+    throw new Error(field + ' must be a real YYYY-MM-DD calendar date.')
+  }
+  return day
+}
 
 /** Institution-specific demo policy, default fifth of the following month. */
 export function reportDueDate(period: string, dueDay = 5): string {
@@ -185,10 +232,49 @@ function migrateFleetState(state: FleetState): FleetState {
       }
       : defaultDepartmentProfile(name, state.vehicles)
   })
+  const reports = state.reports.map(report => {
+    if (report.attributionSource && report.departmentAtSubmission && report.unitAtSubmission) return report
+    const vehicle = state.vehicles.find(v => v.id === report.vehicleId)
+    return {
+      ...report,
+      departmentAtSubmission: report.departmentAtSubmission ?? vehicle?.department,
+      unitAtSubmission: report.unitAtSubmission ?? vehicle?.unit,
+      plateAtSubmission: report.plateAtSubmission ?? vehicle?.plate,
+      licensedAtSubmission: report.licensedAtSubmission ?? vehicle?.licensed,
+      attributionSource: report.attributionSource ?? 'Legacy inferred' as const,
+    }
+  })
+  const legacyReportHistory = Array.isArray(state.reportHistory) ? state.reportHistory : []
+  const legacyTicketHistory = Array.isArray(state.ticketHistory) ? state.ticketHistory : []
+  const reportHistory = [
+    ...legacyReportHistory,
+    ...reports.filter(report => !legacyReportHistory.some(item => item.reportId === report.id))
+      .map(report => ({
+        id: 'history-baseline-' + report.id, reportId: report.id, revision: report.revision,
+        at: report.reviewedAt ?? report.submittedAt, actor: report.reviewedBy ?? report.operator,
+        action: 'Imported snapshot' as const, snapshot: { ...report },
+      })),
+  ]
+  const ticketHistory = [
+    ...legacyTicketHistory,
+    ...state.tickets.filter(ticket => !legacyTicketHistory.some(item => item.ticketId === ticket.id))
+      .map(ticket => ({
+        id: 'history-baseline-' + ticket.id, ticketId: ticket.id,
+        at: ticket.updatedAt, actor: 'Demo data import',
+        action: 'Imported snapshot', snapshot: { ...ticket },
+      })),
+  ]
   return {
     ...state,
+    reports,
     departmentProfiles,
-    followUps: Array.isArray(state.followUps) ? state.followUps : [],
+    followUps: Array.isArray(state.followUps) ? state.followUps.map(task => ({
+      ...task,
+      status: task.status === 'Closed' ? 'Closed' as const : 'Open' as const,
+      owner: task.owner || task.actor,
+    })) : [],
+    reportHistory,
+    ticketHistory,
   }
 }
 export function getDepartmentProfile(state: FleetState, name: string): DepartmentProfile {
@@ -201,6 +287,20 @@ function id(prefix: string): string {
 function stamp(): string { return new Date().toISOString() }
 function event(actor: string, action: string, detail: string, vehicleId?: string, reportId?: string): AuditEntry {
   return { id: id('evt'), at: stamp(), actor, action, detail, vehicleId, reportId }
+}
+function reportSnapshot(report: MonthlyReport, action: ReportHistoryEntry['action'], actor: string): ReportHistoryEntry {
+  return { id: id('rh'), reportId: report.id, revision: report.revision, at: stamp(), actor, action, snapshot: { ...report } }
+}
+function ticketSnapshot(ticket: MaintenanceTicket, action: string, actor: string): TicketHistoryEntry {
+  return { id: id('th'), ticketId: ticket.id, at: stamp(), actor, action, snapshot: { ...ticket } }
+}
+export function getReportHistory(state: FleetState, reportId: string): ReportHistoryEntry[] {
+  // Entries are inserted newest-first. Preserve that order rather than
+  // reordering transitions if a browser's wall clock changes or timestamps tie.
+  return (state.reportHistory ?? []).filter(entry => entry.reportId === reportId)
+}
+export function getTicketHistory(state: FleetState, ticketId: string): TicketHistoryEntry[] {
+  return (state.ticketHistory ?? []).filter(entry => entry.ticketId === ticketId)
 }
 function cleanText(value: string, field: string, min = 1, max = 240): string {
   const text = String(value ?? '').trim()
@@ -253,6 +353,9 @@ export function createDemoFleet(period = currentPeriod()): FleetState {
       reviewedAt: statuses[index % statuses.length] === 'Pending' ? undefined : new Date(Date.now() - index * 86400000).toISOString(),
       reviewNote: statuses[index % statuses.length] === 'Returned' ? 'Please confirm the final odometer reading.' : undefined,
       revision: 1,
+      departmentAtSubmission: vehicle.department, unitAtSubmission: vehicle.unit,
+      plateAtSubmission: vehicle.plate, licensedAtSubmission: vehicle.licensed,
+      attributionSource: 'Recorded',
     }
   })
   // Prior-month examples make fiscal-quarter reconciliation and trend views
@@ -274,22 +377,27 @@ export function createDemoFleet(period = currentPeriod()): FleetState {
         condition: 'Good', notes: '', operator: vehicle.custodian,
         submittedAt: new Date(Date.now() - (monthsBack * 30 + 4) * 86400000).toISOString(),
         status,
-        reviewedBy: status === 'Pending' ? undefined : 'Department Supervisor',
+        // A fictional legacy approval lacking reviewer evidence provides an
+        // actionable quarterly data-quality scenario in the demo workspace.
+        reviewedBy: status === 'Pending' || (vehicle.id === 'v004' && monthsBack === 2) ? undefined : 'Department Supervisor',
         reviewedAt: status === 'Pending' ? undefined : new Date(Date.now() - (monthsBack * 30 + 2) * 86400000).toISOString(),
         reviewNote: status === 'Returned' ? 'Clarify fuel receipt total.' : undefined,
         revision: 1,
+        departmentAtSubmission: vehicle.department, unitAtSubmission: vehicle.unit,
+        plateAtSubmission: vehicle.plate, licensedAtSubmission: vehicle.licensed,
+        attributionSource: 'Recorded',
       })
     }
   })
   const tickets: MaintenanceTicket[] = [
     { id: 't001', vehicleId: 'v002', title: 'Intermittent starting issue', description: 'Driver reports occasional slow starts after overnight parking.', severity: 'Medium', status: 'Open', createdAt: stamp(), updatedAt: stamp(), sourceReportId: reports.find(r => r.vehicleId === 'v002')?.id, assignee: 'Garage team' },
-    { id: 't002', vehicleId: 'v005', title: 'Rear tire vibration', description: 'Inspect tire balance and wear before next highway route.', severity: 'High', status: 'Scheduled', createdAt: stamp(), updatedAt: stamp(), sourceReportId: reports.find(r => r.vehicleId === 'v005')?.id, assignee: 'Service contractor' },
+    { id: 't002', vehicleId: 'v005', title: 'Rear tire vibration', description: 'Inspect tire balance and wear before next highway route.', severity: 'High', status: 'Scheduled', createdAt: stamp(), updatedAt: stamp(), sourceReportId: reports.find(r => r.vehicleId === 'v005')?.id, assignee: 'Service contractor', scheduledFor: localDay(new Date(Date.now() + 3 * 86400000)) },
     { id: 't003', vehicleId: 'v006', title: 'Oil change overdue', description: 'Schedule preventive service and review prior maintenance history.', severity: 'Low', status: 'Open', createdAt: stamp(), updatedAt: stamp() },
   ]
   const audit: AuditEntry[] = [
     { id: 'evt-demo-1', at: stamp(), actor: 'Demo system', action: 'Demo initialized', detail: 'Fictional campus vehicle records loaded.' },
   ]
-  return migrateFleetState({ schemaVersion: 1, vehicles, reports: [...reports, ...historicalReports], tickets, audit, departmentProfiles: [], followUps: [] })
+  return migrateFleetState({ schemaVersion: 1, vehicles, reports: [...reports, ...historicalReports], tickets, audit, departmentProfiles: [], followUps: [], reportHistory: [], ticketHistory: [] })
 }
 
 export function loadFleetState(storage: Pick<Storage, 'getItem'> | null = typeof localStorage !== 'undefined' ? localStorage : null): FleetState {
@@ -311,6 +419,14 @@ export function saveFleetState(state: FleetState, storage: Pick<Storage, 'setIte
 export function activeReportFor(state: FleetState, vehicleId: string, period: string): MonthlyReport | undefined {
   return state.reports.find(r => r.vehicleId === vehicleId && r.period === period)
 }
+/** Reporting coverage is month-scoped, so newly added/retired assets do not rewrite older quarters. */
+export function requiresMonthlyReport(vehicle: Vehicle, period: string): boolean {
+  parsePeriod(period)
+  if (vehicle.reportingStartPeriod && period < vehicle.reportingStartPeriod) return false
+  if (vehicle.retiredAfterPeriod && period > vehicle.retiredAfterPeriod) return false
+  if (vehicle.status === 'Retired' && !vehicle.retiredAfterPeriod) return false // legacy retirement date unknown
+  return true
+}
 export function getOdometerWarnings(state: FleetState, vehicleId: string, period: string, start: number, end: number): string[] {
   const earlier = state.reports
     .filter(r => r.vehicleId === vehicleId && r.period < period && r.status === 'Approved')
@@ -327,9 +443,10 @@ export function getOdometerWarnings(state: FleetState, vehicleId: string, period
 
 export function submitMonthlyReport(state: FleetState, input: ReportInput): FleetState {
   const vehicle = state.vehicles.find(v => v.id === input.vehicleId)
-  if (!vehicle || vehicle.status === 'Retired') throw new Error('Choose an active vehicle.')
+  if (!vehicle) throw new Error('Choose a vehicle.')
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(input.period)) throw new Error('Choose a valid reporting month.')
   if (input.period > currentPeriod()) throw new Error('Future reporting months cannot be submitted.')
+  if (!requiresMonthlyReport(vehicle, input.period)) throw new Error('This vehicle is outside its required reporting period.')
   const operator = cleanText(input.operator, 'Operator name', 2, 80)
   const notes = cleanText(input.notes ?? '', 'Notes', 0, 1200)
   const start = finiteNonnegative(Number(input.startOdometer), 'Starting odometer')
@@ -355,6 +472,11 @@ export function submitMonthlyReport(state: FleetState, input: ReportInput): Flee
     fuelGallons: gallons, fuelCost: cost, id: reportId, submittedAt: stamp(),
     status: 'Pending', reviewedAt: undefined, reviewedBy: undefined, reviewNote: undefined,
     revision: (prior?.revision ?? 0) + 1,
+    departmentAtSubmission: prior?.departmentAtSubmission ?? vehicle.department,
+    unitAtSubmission: prior?.unitAtSubmission ?? vehicle.unit,
+    plateAtSubmission: prior?.plateAtSubmission ?? vehicle.plate,
+    licensedAtSubmission: prior?.licensedAtSubmission ?? vehicle.licensed,
+    attributionSource: prior?.attributionSource ?? 'Recorded',
   }
   const reports = prior ? state.reports.map(r => r.id === prior.id ? report : r) : [report, ...state.reports]
   const existingTicket = state.tickets.find(t => t.sourceReportId === reportId && t.status !== 'Resolved')
@@ -365,15 +487,21 @@ export function submitMonthlyReport(state: FleetState, input: ReportInput): Flee
     description: notes, severity: input.condition === 'Unsafe' ? 'High' : 'Medium',
     status: 'Open', createdAt: stamp(), updatedAt: stamp(), sourceReportId: reportId,
   } : null
+  const nextTickets = ticket
+    ? [ticket, ...state.tickets]
+    : escalateTicket && existingTicket
+      ? state.tickets.map(t => t.id === existingTicket.id
+        ? { ...t, severity: 'High' as Severity, status: 'Open' as TicketStatus, title: 'Safety-critical condition reported', description: notes, updatedAt: stamp(), resolvedAt: undefined }
+        : t)
+      : state.tickets
+  const updatedTicket = ticket ?? (escalateTicket ? nextTickets.find(t => t.id === existingTicket?.id) : undefined)
   return {
     ...state, reports,
-    tickets: ticket
-      ? [ticket, ...state.tickets]
-      : escalateTicket
-        ? state.tickets.map(t => t.id === existingTicket.id
-          ? { ...t, severity: 'High' as Severity, status: 'Open' as TicketStatus, title: 'Safety-critical condition reported', description: notes, updatedAt: stamp() }
-          : t)
-        : state.tickets,
+    reportHistory: [reportSnapshot(report, prior ? 'Resubmitted' : 'Submitted', operator), ...(state.reportHistory ?? [])],
+    tickets: nextTickets,
+    ticketHistory: updatedTicket
+      ? [ticketSnapshot(updatedTicket, ticket ? 'Driver condition report' : 'Escalated after unsafe revision', operator), ...(state.ticketHistory ?? [])]
+      : state.ticketHistory,
     vehicles: input.condition === 'Unsafe'
       ? state.vehicles.map(v => v.id === vehicle.id && v.status !== 'Retired' ? { ...v, status: 'In maintenance' as VehicleStatus } : v)
       : state.vehicles,
@@ -408,13 +536,43 @@ export function reviewMonthlyReport(state: FleetState, reportId: string, decisio
     }
   }
   const updated: MonthlyReport = { ...report, status: decision, reviewedBy: actor, reviewedAt: stamp(), reviewNote: reason }
+  const closingTasks = decision === 'Approved' ? (state.followUps ?? []).filter(task =>
+    task.vehicleId === report.vehicleId && task.period === report.period && task.status !== 'Closed') : []
+  const now = stamp()
   return {
     ...state,
     reports: state.reports.map(r => r.id === reportId ? updated : r),
+    reportHistory: [reportSnapshot(updated, decision, actor), ...(state.reportHistory ?? [])],
+    followUps: closingTasks.length ? (state.followUps ?? []).map(task =>
+      closingTasks.some(item => item.id === task.id)
+        ? { ...task, status: 'Closed' as const, outcome: 'Report approved; reporting exception resolved.', closedAt: now, closedBy: 'FleetSync' }
+        : task,
+    ) : state.followUps,
     vehicles: decision === 'Approved'
       ? state.vehicles.map(v => v.id === report.vehicleId && report.endOdometer > v.odometer ? { ...v, odometer: report.endOdometer } : v)
       : state.vehicles,
-    audit: [event(actor, 'Report ' + decision.toLowerCase(), (vehicle?.unit ?? report.vehicleId) + ' · ' + report.period + (reason ? ' · ' + reason : ''), report.vehicleId, report.id), ...state.audit],
+    audit: [
+      event(actor, 'Report ' + decision.toLowerCase(), (vehicle?.unit ?? report.vehicleId) + ' · ' + report.period + (reason ? ' · ' + reason : ''), report.vehicleId, report.id),
+      ...(closingTasks.length ? [event('FleetSync', 'Reporting follow-ups resolved', (vehicle?.unit ?? report.vehicleId) + ' · ' + closingTasks.length + ' open task(s) closed on approval', report.vehicleId, report.id)] : []),
+      ...state.audit,
+    ],
+  }
+}
+/** Audited amendment workflow; an already approved report is never silently overwritten. */
+export function reopenApprovedReportForCorrection(state: FleetState, reportId: string, actor: string, reason: string): FleetState {
+  const report = state.reports.find(item => item.id === reportId)
+  if (!report || report.status !== 'Approved') throw new Error('Only approved reports can be reopened for correction.')
+  const by = cleanText(actor, 'Correction requested by', 2, 80)
+  const explanation = cleanText(reason, 'Correction reason', 5, 400)
+  const updated: MonthlyReport = {
+    ...report, status: 'Returned', reviewedBy: by, reviewedAt: stamp(), reviewNote: explanation,
+  }
+  const vehicle = state.vehicles.find(item => item.id === report.vehicleId)
+  return {
+    ...state,
+    reports: state.reports.map(item => item.id === reportId ? updated : item),
+    reportHistory: [reportSnapshot(updated, 'Reopened for correction', by), ...(state.reportHistory ?? [])],
+    audit: [event(by, 'Approved report reopened for correction', (vehicle?.unit ?? report.vehicleId) + ' · ' + report.period + ' · ' + explanation, report.vehicleId, reportId), ...state.audit],
   }
 }
 
@@ -429,7 +587,12 @@ export function addMaintenanceTicket(state: FleetState, input: TicketInput, acto
     status: 'Open', createdAt: stamp(), updatedAt: stamp(),
     assignee: (input.assignee ?? '').trim() || undefined,
   }
-  return { ...state, tickets: [ticket, ...state.tickets], audit: [event(actor, 'Maintenance issue created', vehicle.unit + ' · ' + title, vehicle.id), ...state.audit] }
+  return {
+    ...state,
+    tickets: [ticket, ...state.tickets],
+    ticketHistory: [ticketSnapshot(ticket, 'Created', actor), ...(state.ticketHistory ?? [])],
+    audit: [event(actor, 'Maintenance issue created', vehicle.unit + ' · ' + title, vehicle.id), ...state.audit],
+  }
 }
 
 export interface MaintenanceUpdate {
@@ -437,6 +600,7 @@ export interface MaintenanceUpdate {
   scheduledFor?: string
   resolutionNote?: string
   actualCost?: number
+  reopenReason?: string
 }
 export function updateMaintenanceTicket(state: FleetState, ticketId: string, status: TicketStatus, actor = 'Maintenance', details: MaintenanceUpdate = {}): FleetState {
   const ticket = state.tickets.find(t => t.id === ticketId)
@@ -453,6 +617,10 @@ export function updateMaintenanceTicket(state: FleetState, ticketId: string, sta
   const resolutionNote = details.resolutionNote === undefined ? ticket.resolutionNote : cleanText(details.resolutionNote, 'Resolution note', 0, 1000) || undefined
   const actualCost = details.actualCost === undefined ? ticket.actualCost : finiteNonnegative(details.actualCost, 'Service cost')
   if (status === 'Resolved' && !resolutionNote?.trim()) throw new Error('Describe the repair or follow-up before resolving the issue.')
+  if (status === 'Scheduled' && (!assignee || !scheduledFor)) throw new Error('Assign a responsible technician and scheduled date before marking the work scheduled.')
+  if (status === 'Resolved' && !assignee) throw new Error('Assign a responsible technician before resolving the work.')
+  const reopened = ticket.status === 'Resolved' && status !== 'Resolved'
+  const reopenReason = reopened ? cleanText(details.reopenReason ?? '', 'Reason for reopening work', 5, 400) : ''
   const updated: MaintenanceTicket = {
     ...ticket, status, assignee, scheduledFor, resolutionNote, actualCost,
     resolvedAt: status === 'Resolved' ? (ticket.resolvedAt ?? stamp()) : undefined,
@@ -464,7 +632,16 @@ export function updateMaintenanceTicket(state: FleetState, ticketId: string, sta
   return {
     ...state,
     tickets: state.tickets.map(t => t.id === ticketId ? updated : t),
-    audit: [event(actor, ticket.status === status ? 'Maintenance details updated' : 'Maintenance ' + status.toLowerCase(), (vehicle?.unit ?? ticket.vehicleId) + ' · ' + ticket.title + (resolutionNote && status === 'Resolved' ? ' · ' + resolutionNote : ''), ticket.vehicleId), ...state.audit],
+    vehicles: reopened && ticket.severity === 'High'
+      ? state.vehicles.map(v => v.id === ticket.vehicleId && v.status !== 'Retired' ? { ...v, status: 'In maintenance' as VehicleStatus } : v)
+      : state.vehicles,
+    ticketHistory: [ticketSnapshot(updated, reopened ? 'Reopened: ' + reopenReason : status === ticket.status ? 'Details updated' : status, actor), ...(state.ticketHistory ?? [])],
+    audit: [
+      event(actor, reopened ? 'Maintenance reopened' : ticket.status === status ? 'Maintenance details updated' : 'Maintenance ' + status.toLowerCase(),
+        (vehicle?.unit ?? ticket.vehicleId) + ' · ' + ticket.title + (reopened ? ' · ' + reopenReason : resolutionNote && status === 'Resolved' ? ' · ' + resolutionNote : ''), ticket.vehicleId),
+      ...(reopened && ticket.severity === 'High' && vehicle?.status !== 'In maintenance' ? [event('FleetSync', 'Service hold reapplied', (vehicle?.unit ?? ticket.vehicleId) + ' · high-priority work reopened', ticket.vehicleId)] : []),
+      ...state.audit,
+    ],
   }
 }
 
@@ -481,7 +658,7 @@ export function addVehicle(state: FleetState, input: VehicleInput, actor = 'Flee
   if (!Number.isInteger(input.year) || input.year < 1990 || input.year > new Date().getFullYear() + 1) throw new Error('Enter a valid model year.')
   if (!Number.isInteger(input.odometer) || input.odometer < 0) throw new Error('Odometer must be a nonnegative whole number.')
   const notes = cleanText(input.notes ?? '', 'Vehicle notes', 0, 600)
-  const vehicle: Vehicle = { ...input, id: id('v'), unit, department, make, model, custodian, plate, notes, status: 'Active' }
+  const vehicle: Vehicle = { ...input, id: id('v'), unit, department, make, model, custodian, plate, notes, status: 'Active', reportingStartPeriod: currentPeriod(), retiredAfterPeriod: undefined }
   const withVehicle = { ...state, vehicles: [...state.vehicles, vehicle], audit: [event(actor, 'Vehicle added', unit + ' · ' + make + ' ' + model, vehicle.id), ...state.audit] }
   return migrateFleetState(withVehicle)
 }
@@ -505,19 +682,58 @@ export function updateDepartmentProfile(state: FleetState, name: string, input: 
   }
 }
 
-/** Logs an internal follow-up; sends no email, SMS or external notification. */
-export function recordReportFollowUp(state: FleetState, vehicleId: string, period: string, actor: string, note: string): FleetState {
+/** Creates an INTERNAL follow-up task; no message is sent to anyone. */
+export function recordReportFollowUp(state: FleetState, vehicleId: string, period: string, actor: string, note: string, nextDueOn?: string, owner?: string): FleetState {
   const vehicle = state.vehicles.find(v => v.id === vehicleId)
   if (!vehicle) throw new Error('Vehicle not found.')
   parsePeriod(period)
+  if (period > currentPeriod()) throw new Error('Cannot schedule follow-up for a future reporting month.')
+  if (activeReportFor(state, vehicleId, period)?.status === 'Approved') throw new Error('This month is already approved. No missing-report follow-up is needed.')
   const by = cleanText(actor, 'Recorded by', 2, 80)
   const reason = cleanText(note, 'Follow-up note', 5, 400)
-  const followUp: FollowUp = { id: id('followup'), vehicleId, period, actor: by, note: reason, at: stamp() }
+  const dueOn = nextDueOn ? validDay(nextDueOn, 'Next follow-up date') : localDay(new Date(Date.now() + 3 * 86400000))
+  const accountableOwner = cleanText(owner || getDepartmentProfile(state, vehicle.department).coordinator, 'Follow-up owner', 2, 80)
+  const followUp: FollowUp = { id: id('followup'), vehicleId, period, actor: by, note: reason, at: stamp(), status: 'Open', owner: accountableOwner, dueOn }
   return {
     ...state,
     followUps: [followUp, ...(state.followUps ?? [])],
-    audit: [event(by, 'Follow-up logged (not sent)', vehicle.unit + ' · ' + period + ' · ' + reason, vehicleId), ...state.audit],
+    audit: [event(by, 'Follow-up logged (not sent)', vehicle.unit + ' · ' + period + ' · ' + reason + ' · owner ' + accountableOwner + ' · next ' + dueOn + ' · task open', vehicleId), ...state.audit],
   }
+}
+
+export interface FollowUpUpdate { dueOn?: string; owner?: string; outcome?: string }
+export function updateReportFollowUp(state: FleetState, followUpId: string, status: 'Open' | 'Closed', actor: string, options: FollowUpUpdate = {}): FleetState {
+  const existing = (state.followUps ?? []).find(item => item.id === followUpId)
+  if (!existing) throw new Error('Follow-up task not found.')
+  if (existing.status === 'Closed') throw new Error('Closed follow-up records cannot be changed. Create a new task for another action.')
+  if (status !== 'Open' && status !== 'Closed') throw new Error('Invalid follow-up task status.')
+  const by = cleanText(actor, 'Updated by', 2, 80)
+  const owner = options.owner === undefined ? existing.owner ?? existing.actor : cleanText(options.owner, 'Follow-up owner', 2, 80)
+  const dueOn = options.dueOn === undefined ? existing.dueOn : validDay(options.dueOn, 'Next follow-up date')
+  const outcome = options.outcome === undefined ? existing.outcome : cleanText(options.outcome, 'Follow-up outcome', 0, 400) || undefined
+  if (status === 'Closed' && (!outcome || outcome.length < 5)) throw new Error('Record an outcome of at least five characters before closing a follow-up task.')
+  if (status === 'Open' && dueOn && daysAfter(dueOn) > 0 && options.dueOn !== undefined) {
+    throw new Error('A rescheduled follow-up date cannot be in the past.')
+  }
+  const updated: FollowUp = {
+    ...existing, owner, dueOn, outcome, status,
+    ...(status === 'Closed' ? { closedAt: stamp(), closedBy: by } : {}),
+  }
+  if (existing.status === updated.status && existing.dueOn === updated.dueOn &&
+      existing.owner === updated.owner && existing.outcome === updated.outcome) return state
+  const vehicle = state.vehicles.find(v => v.id === existing.vehicleId)
+  return {
+    ...state,
+    followUps: (state.followUps ?? []).map(task => task.id === followUpId ? updated : task),
+    audit: [event(by, status === 'Closed' ? 'Follow-up task closed (no message sent)' : 'Follow-up task updated (no message sent)',
+      (vehicle?.unit ?? existing.vehicleId) + ' · ' + existing.period + ' · ' + (outcome || existing.note) + ' · owner ' + owner + (dueOn ? ' · next ' + dueOn : ''), existing.vehicleId), ...state.audit],
+  }
+}
+export function getOpenFollowUps(state: FleetState, period?: string, department = 'All departments'): FollowUp[] {
+  return (state.followUps ?? [])
+    .filter(task => task.status !== 'Closed' && (!period || task.period === period) &&
+      (department === 'All departments' || state.vehicles.some(v => v.id === task.vehicleId && v.department === department)))
+    .sort((a, b) => (a.dueOn ?? '9999-12-31').localeCompare(b.dueOn ?? '9999-12-31') || b.at.localeCompare(a.at))
 }
 /** Audits that a local review worksheet was prepared; makes no state submission claim. */
 export function recordExportPreparation(state: FleetState, scope: 'Monthly' | 'Quarterly', label: string, recordCount: number, actor = 'Demo Fleet Admin'): FleetState {
@@ -562,13 +778,16 @@ export function setVehicleStatus(state: FleetState, vehicleId: string, status: V
   if (!vehicle) throw new Error('Vehicle not found.')
   if (!(['Active', 'In maintenance', 'Retired'] as VehicleStatus[]).includes(status)) throw new Error('Invalid vehicle status.')
   if (vehicle.status === status) return state
+  if (vehicle.status === 'Retired' && status !== 'Retired') throw new Error('Retired assets cannot be reactivated in the browser demo. Confirm a new reporting assignment separately.')
   const reason = cleanText(note, 'Status change reason', 5, 400)
   if (status === 'Active' && state.tickets.some(t => t.vehicleId === vehicleId && t.status !== 'Resolved' && t.severity === 'High')) {
     throw new Error('Resolve high-priority service issues before releasing this vehicle to active service.')
   }
   return {
     ...state,
-    vehicles: state.vehicles.map(v => v.id === vehicleId ? { ...v, status } : v),
+    vehicles: state.vehicles.map(v => v.id === vehicleId ? {
+      ...v, status, retiredAfterPeriod: status === 'Retired' ? currentPeriod() : v.retiredAfterPeriod,
+    } : v),
     audit: [event(actor, 'Vehicle status changed', vehicle.unit + ' · ' + vehicle.status + ' → ' + status + ' · ' + reason, vehicleId), ...state.audit],
   }
 }
@@ -576,12 +795,15 @@ export function setVehicleStatus(state: FleetState, vehicleId: string, status: V
 export function getExceptions(state: FleetState, period: string, department = 'All departments', asOf = new Date()): FleetException[] {
   const exceptions: FleetException[] = []
   for (const vehicle of state.vehicles) {
-    if (vehicle.status === 'Retired' || (department !== 'All departments' && vehicle.department !== department)) continue
+    if (!requiresMonthlyReport(vehicle, period) || (department !== 'All departments' && vehicle.department !== department)) continue
     const report = activeReportFor(state, vehicle.id, period)
     const profile = getDepartmentProfile(state, vehicle.department)
     const dueDate = reportDueDate(period, profile.monthlyDueDay)
     const daysOverdue = Math.max(0, daysAfter(dueDate, asOf))
     const lastFollowUpAt = (state.followUps ?? []).filter(f => f.vehicleId === vehicle.id && f.period === period).sort((a, b) => b.at.localeCompare(a.at))[0]?.at
+    const openTasks = (state.followUps ?? []).filter(task => task.vehicleId === vehicle.id && task.period === period && task.status !== 'Closed')
+    const openFollowUpCount = openTasks.length
+    const nextFollowUpDue = [...openTasks].map(task => task.dueOn).filter((day): day is string => Boolean(day)).sort()[0]
     const owner = profile.coordinator
     if (!report) {
       const overdue = daysOverdue > 0
@@ -589,17 +811,17 @@ export function getExceptions(state: FleetState, period: string, department = 'A
         id: 'missing:' + vehicle.id + ':' + period, vehicleId: vehicle.id, label: vehicle.unit,
         detail: vehicle.department + ' · ' + displayPeriod(period) + (overdue ? ' · ' + daysOverdue + ' day(s) late' : ' · due ' + dueDate),
         type: overdue ? 'Overdue report' : 'Missing report', priority: overdue ? 'High' : 'Medium',
-        owner, dueDate, daysOverdue, lastFollowUpAt,
+        owner, dueDate, daysOverdue, lastFollowUpAt, openFollowUpCount, nextFollowUpDue,
       })
     } else if (report.status === 'Pending') {
       exceptions.push({
         id: 'pending:' + report.id, vehicleId: vehicle.id, reportId: report.id, label: vehicle.unit,
         detail: vehicle.department + ' · awaiting supervisor approval' + (daysOverdue > 0 ? ' · ' + daysOverdue + ' day(s) past due' : ''),
         type: daysOverdue > 0 ? 'Overdue approval' : 'Awaiting approval',
-        priority: daysOverdue > 0 ? 'High' : 'Low', owner, dueDate, daysOverdue,
+        priority: daysOverdue > 0 ? 'High' : 'Low', owner, dueDate, daysOverdue, lastFollowUpAt, openFollowUpCount, nextFollowUpDue,
       })
     } else if (report.status === 'Returned') {
-      exceptions.push({ id: 'returned:' + report.id, vehicleId: vehicle.id, reportId: report.id, label: vehicle.unit, detail: report.reviewNote || 'Report returned for correction', type: 'Returned report', priority: 'High', owner, dueDate, daysOverdue, lastFollowUpAt })
+      exceptions.push({ id: 'returned:' + report.id, vehicleId: vehicle.id, reportId: report.id, label: vehicle.unit, detail: report.reviewNote || 'Report returned for correction', type: 'Returned report', priority: 'High', owner, dueDate, daysOverdue, lastFollowUpAt, openFollowUpCount, nextFollowUpDue })
     }
     if (report?.condition === 'Unsafe' && state.tickets.some(t => t.sourceReportId === report.id && t.status !== 'Resolved')) {
       exceptions.push({ id: 'unsafe:' + report.id, vehicleId: vehicle.id, reportId: report.id, label: vehicle.unit, detail: report.notes || 'Unsafe condition noted', type: 'Safety alert', priority: 'High', owner })
@@ -627,7 +849,7 @@ export function getExceptions(state: FleetState, period: string, department = 'A
 }
 
 export function fleetMetrics(state: FleetState, period: string, department = 'All departments') {
-  const vehicles = state.vehicles.filter(v => v.status !== 'Retired' && (department === 'All departments' || v.department === department))
+  const vehicles = state.vehicles.filter(v => requiresMonthlyReport(v, period) && (department === 'All departments' || v.department === department))
   const ids = new Set(vehicles.map(v => v.id))
   const reports = state.reports.filter(r => r.period === period && ids.has(r.vehicleId))
   const tickets = state.tickets.filter(t => t.status !== 'Resolved' && ids.has(t.vehicleId))
@@ -642,6 +864,7 @@ export function fleetMetrics(state: FleetState, period: string, department = 'Al
     fuelCost: reports.filter(r => r.status === 'Approved').reduce((sum, r) => sum + r.fuelCost, 0),
     overdue: getExceptions(state, period, department).filter(e => e.type === 'Overdue report' || e.type === 'Overdue approval').length,
     serviceHolds: vehicles.filter(v => v.status === 'In maintenance').length,
+    openFollowUps: (state.followUps ?? []).filter(task => task.period === period && task.status !== 'Closed' && ids.has(task.vehicleId)).length,
   }
 }
 
@@ -659,11 +882,13 @@ export interface DepartmentScorecardRow {
   overdue: number
   openTickets: number
   completion: number
+  openFollowUps: number
+  dueFollowUps: number
 }
 export function getDepartmentScorecard(state: FleetState, period: string, asOf = new Date()): DepartmentScorecardRow[] {
   return migrateFleetState(state).departmentProfiles
     .map(profile => {
-      const vehicles = state.vehicles.filter(v => v.department === profile.name && v.status !== 'Retired')
+      const vehicles = state.vehicles.filter(v => v.department === profile.name && requiresMonthlyReport(v, period))
       const reports = vehicles.map(v => activeReportFor(state, v.id, period)).filter((r): r is MonthlyReport => Boolean(r))
       const ids = new Set(vehicles.map(v => v.id))
       const due = reportDueDate(period, profile.monthlyDueDay)
@@ -678,6 +903,8 @@ export function getDepartmentScorecard(state: FleetState, period: string, asOf =
         overdue: late ? vehicles.length - reports.filter(r => r.status === 'Approved').length : 0,
         openTickets: state.tickets.filter(t => ids.has(t.vehicleId) && t.status !== 'Resolved').length,
         completion: vehicles.length ? Math.round(100 * reports.filter(r => r.status === 'Approved').length / vehicles.length) : 100,
+        openFollowUps: (state.followUps ?? []).filter(task => ids.has(task.vehicleId) && task.period === period && task.status !== 'Closed').length,
+        dueFollowUps: (state.followUps ?? []).filter(task => ids.has(task.vehicleId) && task.period === period && task.status !== 'Closed' && task.dueOn && daysAfter(task.dueOn, asOf) >= 0).length,
       }
     })
     .filter(row => row.vehicles > 0)
@@ -715,41 +942,88 @@ export function quarterWindowStartDate(fiscalYear: number, quarter: number): str
   // Texas Government Code §2171.101(a): not before day 45 after quarter end.
   return localDay(new Date(year, month, 45))
 }
-export type QuarterReportStatus = ReportStatus | 'Missing'
+export type QuarterReportStatus = ReportStatus | 'Missing' | 'Not required'
+/** Data-quality checks are independent of submission/approval status. */
+export function getReportQualityIssues(state: FleetState, reportId: string): string[] {
+  const report = state.reports.find(item => item.id === reportId)
+  if (!report) return ['Report record could not be located.']
+  const issues: string[] = []
+  if (report.status !== 'Approved') return issues
+  if (report.attributionSource === 'Legacy inferred') issues.push('Historical vehicle attribution was inferred from the current directory; confirm its original department and plate.')
+  if (!report.departmentAtSubmission || !report.unitAtSubmission) issues.push('Original department or vehicle identifier is missing.')
+  if (!report.reviewedBy?.trim() || !report.reviewedAt) issues.push('Approval reviewer or timestamp is missing.')
+  if (!report.operator?.trim()) issues.push('Vehicle operator is missing.')
+  if (!Number.isInteger(report.startOdometer) || !Number.isInteger(report.endOdometer) ||
+      report.startOdometer < 0 || report.endOdometer < report.startOdometer) issues.push('Odometer readings are invalid.')
+  if (!Number.isFinite(report.fuelGallons) || !Number.isFinite(report.fuelCost) ||
+      report.fuelGallons < 0 || report.fuelCost < 0) issues.push('Fuel values are invalid.')
+  const prior = state.reports.filter(item => item.vehicleId === report.vehicleId && item.period < report.period && item.status === 'Approved')
+    .sort((a, b) => b.period.localeCompare(a.period))[0]
+  const next = state.reports.filter(item => item.vehicleId === report.vehicleId && item.period > report.period && item.status === 'Approved')
+    .sort((a, b) => a.period.localeCompare(b.period))[0]
+  if (prior && report.startOdometer < prior.endOdometer) issues.push('Starting odometer overlaps an earlier approved month (' + prior.period + ').')
+  if (next && report.endOdometer > next.startOdometer) issues.push('Ending odometer overlaps a later approved month (' + next.period + ').')
+  if (report.endOdometer - report.startOdometer > 4000 && report.notes.trim().length < 15) {
+    issues.push('High-mileage usage lacks a detailed explanation.')
+  }
+  if (state.reports.filter(item => item.vehicleId === report.vehicleId && item.period === report.period).length > 1) {
+    issues.push('Multiple monthly records exist for this vehicle and period.')
+  }
+  return issues
+}
 export interface QuarterVehicleRow {
   vehicle: Vehicle
   monthlyStatus: Record<string, QuarterReportStatus>
+  monthlyDepartments: Record<string, string>
   approvedMonths: number
+  expectedMonths: number
   miles: number
   fuelCost: number
   ready: boolean
+  qualityIssues: string[]
 }
 export function quarterReadiness(state: FleetState, fiscalYear: number, quarter: number, department = 'All departments') {
   const months = fiscalQuarterMonths(fiscalYear, quarter)
-  const vehicles = state.vehicles.filter(v => v.licensed && v.status !== 'Retired' && (department === 'All departments' || department === v.department))
+  const vehicles = state.vehicles.filter(v => {
+    const monthly = months.map(period => activeReportFor(state, v.id, period))
+    const hasLicensedHistory = monthly.some(report => report && (report.licensedAtSubmission ?? v.licensed))
+    if (!v.licensed && !hasLicensedHistory) return false
+    if (!months.some(period => requiresMonthlyReport(v, period)) && !hasLicensedHistory) return false
+    return department === 'All departments' || department === v.department ||
+      monthly.some(report => report?.departmentAtSubmission === department)
+  })
   const rows: QuarterVehicleRow[] = vehicles.map(vehicle => {
     const monthlyStatus: Record<string, QuarterReportStatus> = {}
+    const monthlyDepartments: Record<string, string> = {}
     let approvedMonths = 0
+    let expectedMonths = 0
     let miles = 0
     let fuelCost = 0
+    const qualityIssues: string[] = []
     for (const period of months) {
       const report = activeReportFor(state, vehicle.id, period)
-      monthlyStatus[period] = report?.status ?? 'Missing'
-      if (report?.status === 'Approved') {
+      const required = requiresMonthlyReport(vehicle, period) && (report?.licensedAtSubmission ?? vehicle.licensed)
+      monthlyStatus[period] = required ? (report?.status ?? 'Missing') : 'Not required'
+      monthlyDepartments[period] = report?.departmentAtSubmission ?? vehicle.department
+      if (required) expectedMonths++
+      if (required && report?.status === 'Approved') {
         approvedMonths++
         miles += report.endOdometer - report.startOdometer
         fuelCost += report.fuelCost
+        qualityIssues.push(...getReportQualityIssues(state, report.id).map(issue => period + ': ' + issue))
       }
     }
-    return { vehicle, monthlyStatus, approvedMonths, miles, fuelCost, ready: approvedMonths === 3 }
+    return { vehicle, monthlyStatus, monthlyDepartments, approvedMonths, expectedMonths, miles, fuelCost, qualityIssues, ready: approvedMonths === expectedMonths && qualityIssues.length === 0 }
   })
-  const counts = { Approved: 0, Pending: 0, Returned: 0, Missing: 0 }
+  const counts = { Approved: 0, Pending: 0, Returned: 0, Missing: 0, 'Not required': 0 }
   for (const row of rows) for (const month of months) counts[row.monthlyStatus[month]]++
-  const expected = vehicles.length * 3
+  const expected = rows.reduce((total, row) => total + row.expectedMonths, 0)
   return {
     fiscalYear, quarter, months, dueDate: quarterDueDate(fiscalYear, quarter), windowOpens: quarterWindowStartDate(fiscalYear, quarter),
     vehicles: rows, expected, approved: counts.Approved, pending: counts.Pending, returned: counts.Returned,
     missing: counts.Missing, readyVehicles: rows.filter(r => r.ready).length,
+    dataQualityIssues: rows.reduce((total, row) => total + row.qualityIssues.length, 0),
+    vehiclesWithQualityIssues: rows.filter(row => row.qualityIssues.length > 0).length,
     completion: expected ? Math.round(100 * counts.Approved / expected) : 100,
   }
 }
@@ -757,7 +1031,7 @@ export function quarterReadiness(state: FleetState, fiscalYear: number, quarter:
 const CSV_COLUMNS = [
   'Unit ID (INTERNAL REVIEW ONLY - NOT A TxFS BATCH)', 'Department', 'Vehicle type', 'License / asset tag', 'Reporting month',
   'Starting odometer', 'Ending odometer', 'Distance reported', 'Fuel gallons', 'Fuel cost USD',
-  'Vehicle condition', 'Operator', 'Submitted UTC', 'Supervisor', 'Approved UTC',
+  'Vehicle condition', 'Operator', 'Submitted UTC', 'Supervisor', 'Approved UTC', 'Data quality review', 'Department attribution source',
 ]
 
 function safeCsvCell(value: string | number | undefined): string {
@@ -771,13 +1045,15 @@ function safeCsvCell(value: string | number | undefined): string {
 export function buildReviewCsv(state: FleetState, period: string, department = 'All departments'): { csv: string; count: number } {
   const records = state.reports.filter(r => {
     const vehicle = state.vehicles.find(v => v.id === r.vehicleId)
-    return r.period === period && r.status === 'Approved' && vehicle?.licensed && (department === 'All departments' || vehicle?.department === department)
+    return r.period === period && r.status === 'Approved' && (r.licensedAtSubmission ?? vehicle?.licensed) &&
+      (department === 'All departments' || (r.departmentAtSubmission ?? vehicle?.department) === department)
   })
   const rows = records.map(r => {
     const v = state.vehicles.find(vehicle => vehicle.id === r.vehicleId)!
-    return [v.unit, v.department, v.kind, v.plate, r.period, r.startOdometer, r.endOdometer,
+    const issues = getReportQualityIssues(state, r.id)
+    return [r.unitAtSubmission ?? v.unit, r.departmentAtSubmission ?? v.department, v.kind, r.plateAtSubmission ?? v.plate, r.period, r.startOdometer, r.endOdometer,
       r.endOdometer - r.startOdometer, r.fuelGallons, r.fuelCost.toFixed(2),
-      r.condition, r.operator, r.submittedAt, r.reviewedBy, r.reviewedAt]
+      r.condition, r.operator, r.submittedAt, r.reviewedBy, r.reviewedAt, issues.length ? issues.join(' | ') : 'No issues flagged', r.attributionSource ?? 'Unknown']
   })
   return { csv: [CSV_COLUMNS, ...rows].map(row => row.map(safeCsvCell).join(',')).join('\r\n') + '\r\n', count: rows.length }
 }
@@ -788,15 +1064,18 @@ export function buildQuarterReviewCsv(state: FleetState, fiscalYear: number, qua
   const header = [
     'Unit ID (STAGING ONLY - NOT A TxFS SUBMISSION)', 'Department', 'Vehicle type', 'Plate',
     'Fiscal year', 'Fiscal quarter', ...summary.months.map(m => m + ' review status'),
-    'Approved months (of 3)', 'Approved distance (miles)', 'Approved fuel cost USD',
-    'Quarter reconciliation', 'Service hold',
+    ...summary.months.map(m => m + ' recorded department'),
+    'Approved months', 'Expected months', 'Approved distance (miles)', 'Approved fuel cost USD',
+    'Quarter reconciliation', 'Data-quality issues requiring review', 'Service hold',
   ]
   const rows = summary.vehicles.map(row => [
     row.vehicle.unit, row.vehicle.department, row.vehicle.kind, row.vehicle.plate,
     'FY' + summary.fiscalYear, 'Q' + summary.quarter,
     ...summary.months.map(m => row.monthlyStatus[m]),
-    row.approvedMonths, row.miles, row.fuelCost.toFixed(2),
-    row.ready ? 'COMPLETE' : 'INCOMPLETE - FOLLOW UP',
+    ...summary.months.map(m => row.monthlyDepartments[m]),
+    row.approvedMonths, row.expectedMonths, row.miles, row.fuelCost.toFixed(2),
+    row.ready ? 'COMPLETE' : row.qualityIssues.length ? 'NEEDS DATA CHECK' : 'INCOMPLETE - FOLLOW UP',
+    row.qualityIssues.join(' | '),
     row.vehicle.status === 'In maintenance' ? 'HELD OUT OF SERVICE' : '',
   ])
   return { csv: [header, ...rows].map(row => row.map(safeCsvCell).join(',')).join('\r\n') + '\r\n', count: rows.length }

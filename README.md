@@ -33,12 +33,16 @@ Build before either browser test. The browser scripts use headless Chrome; set `
 The application demonstrates a connected university workflow:
 
 1. **Drivers** choose a unit and month, enter start/end odometer readings, fuel totals and vehicle condition. Chronological odometer overlaps are rejected and unusually high mileage requires explanation. Each submission enters the supervisor queue.
-2. **Supervisors** approve or return reports with review notes. A returned submission retains its revision history in the local audit log and may be corrected and resubmitted.
-3. **Administrators** monitor the current month's reporting, switch to older months to identify overdue submissions, inspect department coordinators and local due-day policies, and log internal follow-up notes. **Logging a follow-up does not send a notification.**
-4. **Maintenance staff** receive linked issues when drivers report vehicle conditions requiring attention. Unsafe reports raise high-priority issues and put the vehicle on a service hold. Staff can assign, schedule and resolve work with repair notes and optional service costs. Returning a held vehicle to active service requires a recorded reason and resolution of high-priority issues.
-5. **Fleet administrators** inspect department completion and historical trends, manage unit information and service status, and export two types of review-only worksheets. The **monthly CSV** includes approved reports for licensed vehicles. The **quarterly reconciliation CSV** flags approved/pending/returned/missing months for each licensed vehicle and computes approved-only usage totals.
+2. **Supervisors** approve or return reports with review notes. Every submission, correction and review appends a read-only-in-the-interface snapshot showing the original mileage, condition, review decision and actor. The current record advances while prior revisions remain available.
+3. **Administrators** monitor overdue and missing monthly records by department, owner and due day. They can create **local follow-up tasks** with a responsible person, next-action date and note, reschedule them, or close them with an outcome. The task stays separate from the submission: logging or closing a follow-up cannot turn a missing report into an approved one. Approval closes related open tasks with a clearly recorded outcome. **The app never sends a notification, email or SMS.**
+4. **Maintenance staff** receive linked issues when drivers report conditions requiring attention. Unsafe reports raise high-priority issues and put the vehicle on a service hold. Scheduling requires an assignee and date, resolution requires an assignee and repair note, and work-order changes append reviewable snapshots. Reopening a resolved issue requires a reason; reopening high-priority work reapplies the service hold. A fleet administrator must separately record the reason for returning a held vehicle to active service.
+5. **Fleet administrators** inspect completion, exceptions, open follow-up tasks and supported month-to-month trends, edit unit and department information, and export two **review-only staging** worksheets. The monthly CSV includes approved licensed-vehicle records and data-quality flags. The quarterly reconciliation CSV displays the status of all three internal months, applicable reporting-month counts, recorded department attribution, approval gaps and data-quality findings, plus approved-only usage totals.
 
-Every major mutation adds an activity-log entry in the browser. Users can filter by department, view missing or late items in the exception queue, open the relevant work item, and reset the fictional sample workspace after confirmation.
+Every major mutation adds an activity-log entry in the browser. Report and maintenance transitions also append full record snapshots. The app migrates earlier browser-local sample records to the new history shape, labeling any unavailable historical vehicle attribution as **legacy inferred** rather than presenting it as verified. Current vehicle edits cannot silently rewrite the recorded unit, plate, licensing or department on newly submitted reports.
+
+Reporting expectations are scoped to each vehicle's applicable months. A unit added today is not shown as missing for months before it entered the demo directory. Retired units retain their earlier reporting periods, and months outside their reporting window appear as **Not required** in quarterly review. Reactivating a retired unit is deliberately outside this local prototype.
+
+Users can filter and search the work tables, navigate to a specific record from an exception, inspect its history, and reset fictional sample data after confirmation. Workspace view preferences are stored locally separately from fleet records.
 
 The demo includes **fictional prior-month records** so quarter reconciliation, late reports and trends can be presented without connecting to an actual campus system. See [the guided demo](docs/DEMO_GUIDE.md) for an end-to-end walkthrough and [product decisions](docs/PRODUCT_DECISIONS.md) for workflow priorities and the interface benchmark.
 
@@ -52,7 +56,7 @@ The demo includes **fictional prior-month records** so quarter reconciliation, l
 
 **Neither CSV is a Comptroller-certified TxFS import file.** Nothing is transmitted to the Texas Fleet Management System. The staging layout has not been independently validated against the official [TxFS batching specifications and import procedures](https://comptroller.texas.gov/purchasing/programs/ovfm/publications.php). It is for local review and reconciliation only.
 
-The prototype has no backend, real university integration, live telematics, official records, signed approvals, notification delivery, durable server audit log, or multiuser synchronization. Browser-local data can be altered or cleared by anyone with browser access. The local audit trail is illustrative, **not tamper-proof**. Production readiness would require real authentication and authorization, a secure database, campus policy validation, tenant segregation, departmental access rules, reliable notifications, system integrations, record retention, and official state-report mapping.
+The prototype has no backend, real university integration, live telematics, official records, signed approvals, notification delivery, durable server audit log, or multiuser synchronization. Browser-local data can be altered or cleared by anyone with browser access. The in-app history is **append-only through normal user actions, not cryptographically immutable or tamper-proof**. Local browser storage can be modified, lost, or overwritten outside the app. Production readiness would require real authentication and authorization, secure transaction storage, role boundaries, campus policy validation, tenant segregation, departmental access rules, reliable notifications, system integrations, record retention, independent audit controls, and official state-report mapping.
 
 ## Campus map (preserved)
 
@@ -74,7 +78,7 @@ For official campus access information, routes and construction updates, use the
 
 ## Project structure
 
-- `src/fleet/domain.ts` — typed fleet records, due-date and fiscal-quarter rules, validations, transitions, exceptions, service holds, reporting trends, audit events, sample data and review exports
+- `src/fleet/domain.ts` — typed fleet records, reporting coverage windows, snapshot histories, department deadlines, internal follow-up tasks, validation and safety transitions, fiscal-quarter quality checks, audit events and review-only exports
 - `src/fleet/App.tsx` / `src/fleet/styles.css` — FleetSync user interface
 - `src/CampusPage.tsx` — campus map entry point with isolated original styles
 - `src/App.tsx` / `src/styles.css` / `src/data/campus.ts` — original campus map app and data, retained

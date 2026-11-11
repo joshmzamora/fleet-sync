@@ -63,11 +63,18 @@ import {
   getDepartmentScorecard,
   getExceptions,
   getOdometerWarnings,
+  getOpenFollowUps,
+  getReportHistory,
+  getReportQualityIssues,
+  getTicketHistory,
   loadFleetState,
   monthlyTrends as getMonthlyTrends,
   quarterReadiness,
   recordExportPreparation,
   recordReportFollowUp,
+  reopenApprovedReportForCorrection,
+  updateReportFollowUp,
+  requiresMonthlyReport,
   reportDueDate,
   reviewMonthlyReport,
   ROLES,
@@ -86,12 +93,15 @@ import type {
   DepartmentProfile,
   FleetException,
   FleetState,
+  FollowUp,
   MaintenanceTicket,
   MonthlyReport,
+  ReportHistoryEntry,
   ReportInput,
   Role,
   Severity,
   TicketInput,
+  TicketHistoryEntry,
   TicketStatus,
   Vehicle,
   VehicleCondition,
@@ -104,6 +114,55 @@ import './styles.css'
 type View = 'overview' | 'reports' | 'vehicles' | 'maintenance' | 'exports'
 type ReportsTab = 'submit' | 'review' | 'history'
 type TicketFilter = 'Active' | 'All' | TicketStatus
+type ExceptionFilter = 'All' | 'Reports' | 'Service'
+const UI_STORAGE_KEY = 'fleetsync-operations-ui-v1'
+
+type SavedFilters = {
+  period: string
+  department: string
+  vehicleSearch: string
+  auditSearch: string
+  exceptionFilter: ExceptionFilter
+  ticketFilter: TicketFilter
+  quarterScope: { fiscalYear: number; quarter: 1 | 2 | 3 | 4 }
+  quarterQualityFilter: 'All' | 'Incomplete' | 'Quality'
+  showClosedFollowUps: boolean
+}
+
+function restoreFilters(): SavedFilters {
+  const defaults: SavedFilters = {
+    period: currentPeriod(),
+    department: 'All departments',
+    vehicleSearch: '',
+    auditSearch: '',
+    exceptionFilter: 'All',
+    ticketFilter: 'Active',
+    quarterScope: fiscalQuarterForPeriod(currentPeriod()),
+    quarterQualityFilter: 'All',
+    showClosedFollowUps: false,
+  }
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(UI_STORAGE_KEY) ?? 'null')
+    if (!parsed || typeof parsed !== 'object') return defaults
+    const value = parsed as Partial<SavedFilters>
+    return {
+      period: typeof value.period === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(value.period) && value.period <= currentPeriod() ? value.period : defaults.period,
+      department: typeof value.department === 'string' && value.department.length <= 80 ? value.department : defaults.department,
+      vehicleSearch: typeof value.vehicleSearch === 'string' ? value.vehicleSearch.slice(0, 120) : '',
+      auditSearch: typeof value.auditSearch === 'string' ? value.auditSearch.slice(0, 120) : '',
+      exceptionFilter: value.exceptionFilter === 'Reports' || value.exceptionFilter === 'Service' ? value.exceptionFilter : 'All',
+      ticketFilter: value.ticketFilter && (value.ticketFilter === 'All' || value.ticketFilter === 'Active' || TICKET_STATUSES.includes(value.ticketFilter as TicketStatus))
+        ? value.ticketFilter : 'Active',
+      quarterScope: value.quarterScope && Number.isInteger(value.quarterScope.fiscalYear) && value.quarterScope.fiscalYear >= 2000 && value.quarterScope.fiscalYear <= 2200 &&
+        [1, 2, 3, 4].includes(value.quarterScope.quarter)
+        ? value.quarterScope : fiscalQuarterForPeriod(typeof value.period === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(value.period) ? value.period : currentPeriod()),
+      quarterQualityFilter: value.quarterQualityFilter === 'Incomplete' || value.quarterQualityFilter === 'Quality' ? value.quarterQualityFilter : 'All',
+      showClosedFollowUps: value.showClosedFollowUps === true,
+    }
+  } catch {
+    return defaults
+  }
+}
 
 type ReportDraft = {
   startOdometer: string
@@ -143,6 +202,7 @@ type ServiceEdit = {
   scheduledFor: string
   resolutionNote: string
   actualCost: string
+  reopenReason: string
 }
 
 type DepartmentDraft = Pick<DepartmentProfile, 'coordinator' | 'contact' | 'monthlyDueDay' | 'notes'>
@@ -251,7 +311,7 @@ function mileageWarnings(
 }
 
 function preferredReportVehicle(state: FleetState, period: string, department = 'All departments') {
-  const candidates = state.vehicles.filter((vehicle) => vehicle.status !== 'Retired' && (department === 'All departments' || vehicle.department === department))
+  const candidates = state.vehicles.filter((vehicle) => requiresMonthlyReport(vehicle, period) && (department === 'All departments' || vehicle.department === department))
   return candidates.find((vehicle) => !activeReportFor(state, vehicle.id, period)) ??
     candidates.find((vehicle) => activeReportFor(state, vehicle.id, period)?.status === 'Returned') ??
     candidates[0]
@@ -284,6 +344,7 @@ function serviceEditFor(ticket: MaintenanceTicket): ServiceEdit {
     scheduledFor: ticket.scheduledFor ?? '',
     resolutionNote: ticket.resolutionNote ?? '',
     actualCost: ticket.actualCost === undefined ? '' : String(ticket.actualCost),
+    reopenReason: '',
   }
 }
 
@@ -310,6 +371,12 @@ function dateLabel(date: string) {
 
 function fiscalQuarterLabel(fiscalYear: number, quarter: number) {
   return 'FY ' + fiscalYear + ' · Q' + quarter
+}
+
+function localDateOffset(days: number) {
+  const date = new Date()
+  date.setDate(date.getDate() + days)
+  return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-')
 }
 
 function Tone({
@@ -368,8 +435,8 @@ function SectionTitle({
   )
 }
 
-function FleetCard({ className = '', children, role }: { className?: string; children: ReactNode; role?: 'tabpanel' }) {
-  return <section role={role} className={'fleet-card ' + className}>{children}</section>
+function FleetCard({ className = '', children, role, id }: { className?: string; children: ReactNode; role?: 'tabpanel'; id?: string }) {
+  return <section id={id} tabIndex={id ? -1 : undefined} role={role} className={'fleet-card ' + className + (id ? ' fleet-record-anchor' : '')}>{children}</section>
 }
 
 function Field({
@@ -408,13 +475,67 @@ function MetaLine({ label, value }: { label: string; value: ReactNode }) {
   return <div className="fleet-meta-line"><span>{label}</span><strong>{value}</strong></div>
 }
 
+function ReportHistoryLedger({ entries }: { entries: ReportHistoryEntry[] }) {
+  return (
+    <section className="fleet-history-ledger" aria-label="Report correction and approval history">
+      <h3>Submission and correction history</h3>
+      <p className="fleet-text-muted">Saved local snapshots, newest first. Prior revisions are retained when reports are returned and resubmitted.</p>
+      {entries.length ? (
+        <ol className="fleet-history-ledger__entries">
+          {entries.map((entry) => (
+            <li className="fleet-history-entry" key={entry.id}>
+              <div className="fleet-history-entry__heading">
+                <strong>Revision {entry.revision} · {entry.action}</strong>
+                <time dateTime={entry.at}>{timestamp(entry.at)}</time>
+              </div>
+              <div className="fleet-history-entry__meta">
+                <span>By {entry.actor}</span>
+                <Tone tone={entry.snapshot.status.toLowerCase()}>{entry.snapshot.status}</Tone>
+                <span>{whole(entry.snapshot.startOdometer)} → {whole(entry.snapshot.endOdometer)} mi</span>
+                <span>{entry.snapshot.condition}</span>
+              </div>
+              {entry.snapshot.reviewNote && <p><strong>Review feedback:</strong> {entry.snapshot.reviewNote}</p>}
+              {entry.snapshot.notes && <p><strong>Report notes:</strong> {entry.snapshot.notes}</p>}
+            </li>
+          ))}
+        </ol>
+      ) : <p className="fleet-text-muted">No saved history snapshots are available for this record.</p>}
+    </section>
+  )
+}
+
+function TicketHistoryLedger({ entries }: { entries: TicketHistoryEntry[] }) {
+  return (
+    <section className="fleet-history-ledger fleet-work-order-history" aria-label="Work order status and resolution history">
+      <h4>Work order activity</h4>
+      {entries.length ? (
+        <ol className="fleet-history-ledger__entries">
+          {entries.map((entry) => (
+            <li className="fleet-history-entry" key={entry.id}>
+              <div className="fleet-history-entry__heading"><strong>{entry.action}</strong><time dateTime={entry.at}>{timestamp(entry.at)}</time></div>
+              <div className="fleet-history-entry__meta">
+                <span>By {entry.actor}</span>
+                <Tone tone={entry.snapshot.status.toLowerCase()}>{entry.snapshot.status}</Tone>
+                <span>{entry.snapshot.assignee || 'Unassigned'}</span>
+                {entry.snapshot.scheduledFor && <span>Scheduled {dateLabel(entry.snapshot.scheduledFor)}</span>}
+              </div>
+              {entry.snapshot.resolutionNote && <p><strong>Resolution:</strong> {entry.snapshot.resolutionNote}</p>}
+            </li>
+          ))}
+        </ol>
+      ) : <p className="fleet-text-muted">No saved changes for this work order.</p>}
+    </section>
+  )
+}
+
 export default function FleetApp() {
   const [fleet, setFleet] = useState<FleetState>(() => loadFleetState())
   const fleetRef = useRef(fleet)
+  const [initialFilters] = useState(restoreFilters)
   const [role, setRole] = useState<Role>('Fleet Admin')
   const [view, setView] = useState<View>('overview')
-  const [period, setPeriod] = useState(currentPeriod)
-  const [department, setDepartment] = useState('All departments')
+  const [period, setPeriod] = useState(initialFilters.period)
+  const [department, setDepartment] = useState(initialFilters.department)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [toasts, setToasts] = useState<Toast[]>([])
   const nextToastId = useRef(0)
@@ -428,29 +549,43 @@ export default function FleetApp() {
   const [reviewer, setReviewer] = useState('Demo Supervisor')
   const [reviewNotes, setReviewNotes] = useState<Record<string, string>>({})
   const [selectedReviewId, setSelectedReviewId] = useState<string | null>(null)
-  const [vehicleSearch, setVehicleSearch] = useState('')
+  const [expandedReportId, setExpandedReportId] = useState<string | null>(null)
+  const [vehicleSearch, setVehicleSearch] = useState(initialFilters.vehicleSearch)
   const [selectedVehicleId, setSelectedVehicleId] = useState<string | null>(fleet.vehicles[0]?.id ?? null)
   const [vehicleFormOpen, setVehicleFormOpen] = useState(false)
   const [vehicleDraft, setVehicleDraft] = useState<VehicleDraft>(blankVehicleDraft)
-  const [ticketFilter, setTicketFilter] = useState<TicketFilter>('Active')
+  const [ticketFilter, setTicketFilter] = useState<TicketFilter>(initialFilters.ticketFilter)
   const [ticketFormOpen, setTicketFormOpen] = useState(false)
   const [selectedTicketId, setSelectedTicketId] = useState<string | null>(null)
+  const [expandedTicketHistoryId, setExpandedTicketHistoryId] = useState<string | null>(null)
   const [ticketDraft, setTicketDraft] = useState<TicketDraft>(() => blankTicketDraft(fleet.vehicles[0]?.id))
-  const [auditSearch, setAuditSearch] = useState('')
+  const [auditSearch, setAuditSearch] = useState(initialFilters.auditSearch)
   const [showAllExceptions, setShowAllExceptions] = useState(false)
-  const [exceptionFilter, setExceptionFilter] = useState<'All' | 'Reports' | 'Service'>('All')
+  const [exceptionFilter, setExceptionFilter] = useState<ExceptionFilter>(initialFilters.exceptionFilter)
   const [editingDepartment, setEditingDepartment] = useState<string | null>(null)
   const [departmentDraft, setDepartmentDraft] = useState<DepartmentDraft>({ coordinator: '', contact: '', monthlyDueDay: 5, notes: '' })
   const [followUpFor, setFollowUpFor] = useState<string | null>(null)
   const [followUpNote, setFollowUpNote] = useState('')
   const [followUpActor, setFollowUpActor] = useState('Demo Fleet Coordinator')
+  const [followUpOwner, setFollowUpOwner] = useState('')
+  const [followUpDueOn, setFollowUpDueOn] = useState(() => localDateOffset(3))
+  const [editingFollowUpId, setEditingFollowUpId] = useState<string | null>(null)
+  const [taskActor, setTaskActor] = useState('Demo Fleet Coordinator')
+  const [taskOwner, setTaskOwner] = useState('')
+  const [taskDueOn, setTaskDueOn] = useState(() => localDateOffset(3))
+  const [taskOutcome, setTaskOutcome] = useState('')
+  const [showClosedFollowUps, setShowClosedFollowUps] = useState(initialFilters.showClosedFollowUps)
   const [vehicleEditId, setVehicleEditId] = useState<string | null>(null)
   const [vehicleEditDraft, setVehicleEditDraft] = useState<VehicleDraft>(blankVehicleDraft)
   const [vehicleStatusDraft, setVehicleStatusDraft] = useState<VehicleStatus>('Active')
   const [vehicleStatusNote, setVehicleStatusNote] = useState('')
   const [serviceEditId, setServiceEditId] = useState<string | null>(null)
-  const [serviceEdit, setServiceEdit] = useState<ServiceEdit>({ status: 'Open', assignee: '', scheduledFor: '', resolutionNote: '', actualCost: '' })
-  const [quarterScope, setQuarterScope] = useState(() => fiscalQuarterForPeriod(currentPeriod()))
+  const [serviceEdit, setServiceEdit] = useState<ServiceEdit>({ status: 'Open', assignee: '', scheduledFor: '', resolutionNote: '', actualCost: '', reopenReason: '' })
+  const [quarterScope, setQuarterScope] = useState(initialFilters.quarterScope)
+  const [quarterQualityFilter, setQuarterQualityFilter] = useState<'All' | 'Incomplete' | 'Quality'>(initialFilters.quarterQualityFilter)
+  const [expandedQualityVehicleId, setExpandedQualityVehicleId] = useState<string | null>(null)
+  const [correctionRequest, setCorrectionRequest] = useState<{ reportId: string; vehicleId: string; period: string; reason: string } | null>(null)
+  const [focusTarget, setFocusTarget] = useState<string | null>(null)
 
   const toast = useCallback((message: string, kind: Toast['kind'] = 'success') => {
     const id = ++nextToastId.current
@@ -460,6 +595,21 @@ export default function FleetApp() {
   }, [])
 
   useEffect(() => () => toastTimers.current.forEach(clearTimeout), [])
+
+  useEffect(() => {
+    if (department !== 'All departments' && !fleet.vehicles.some((vehicle) => vehicle.department === department) && !DEPARTMENTS.includes(department)) {
+      setDepartment('All departments')
+    }
+  }, [department, fleet.vehicles])
+
+  useEffect(() => {
+    const filters: SavedFilters = { period, department, vehicleSearch, auditSearch, exceptionFilter, ticketFilter, quarterScope, quarterQualityFilter, showClosedFollowUps }
+    try {
+      window.localStorage.setItem(UI_STORAGE_KEY, JSON.stringify(filters))
+    } catch {
+      // Filtering remains usable in private browsing even if preferences cannot persist.
+    }
+  }, [period, department, vehicleSearch, auditSearch, exceptionFilter, ticketFilter, quarterScope, quarterQualityFilter, showClosedFollowUps])
 
   useEffect(() => {
     const closeMobileDrawer = () => {
@@ -475,6 +625,18 @@ export default function FleetApp() {
       window.removeEventListener('keydown', escapeDrawer)
     }
   }, [])
+
+  useEffect(() => {
+    if (!focusTarget) return
+    const frame = window.requestAnimationFrame(() => {
+      const element = document.getElementById(focusTarget)
+      if (!element) return
+      element.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      element.focus({ preventScroll: true })
+      setFocusTarget(null)
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [focusTarget, view, reportsTab, ticketFilter, department, period])
 
   const commit = (change: (current: FleetState) => FleetState, message: string): boolean => {
     try {
@@ -518,6 +680,12 @@ export default function FleetApp() {
   }, [filteredTickets])
   const metrics = useMemo(() => fleetMetrics(fleet, period, department), [fleet, period, department])
   const exceptions = useMemo(() => getExceptions(fleet, period, department), [fleet, period, department])
+  const openFollowUpTasks = useMemo(() => getOpenFollowUps(fleet, undefined, department), [fleet, department])
+  const closedFollowUpTasks = useMemo(() => fleet.followUps
+    .filter((task) => task.status === 'Closed' && (department === 'All departments' || fleet.vehicles.some((vehicle) => vehicle.id === task.vehicleId && vehicle.department === department)))
+    .sort((a, b) => (b.closedAt ?? b.at).localeCompare(a.closedAt ?? a.at)), [fleet, department])
+  const visibleFollowUpTasks = showClosedFollowUps ? closedFollowUpTasks : openFollowUpTasks
+  const overdueFollowUps = openFollowUpTasks.filter((task) => Boolean(task.dueOn && task.dueOn < localDateOffset(0))).length
   const displayedExceptions = useMemo(() => exceptions.filter((item) =>
     exceptionFilter === 'All' ||
     (exceptionFilter === 'Reports'
@@ -530,8 +698,13 @@ export default function FleetApp() {
   const reportExisting = reportVehicle ? activeReportFor(fleet, reportVehicle.id, period) : undefined
   const exportData = useMemo(() => buildReviewCsv(fleet, period, department), [fleet, period, department])
   const exportRecords = useMemo(
-    () => filteredReports.filter((report) => report.status === 'Approved' && fleet.vehicles.some((vehicle) => vehicle.id === report.vehicleId && vehicle.licensed)),
-    [filteredReports, fleet.vehicles],
+    () => fleet.reports.filter((report) => {
+      const vehicle = fleet.vehicles.find((item) => item.id === report.vehicleId)
+      return report.period === period && report.status === 'Approved' &&
+        (report.licensedAtSubmission ?? vehicle?.licensed) &&
+        (department === 'All departments' || (report.departmentAtSubmission ?? vehicle?.department) === department)
+    }),
+    [fleet.reports, fleet.vehicles, period, department],
   )
   const mileageAlerts = useMemo(
     () => mileageWarnings(fleet, reportVehicle, period, reportDraft),
@@ -560,10 +733,15 @@ export default function FleetApp() {
     () => buildQuarterReviewCsv(fleet, quarterScope.fiscalYear, quarterScope.quarter, department),
     [fleet, quarterScope, department],
   )
+  const quarterRows = useMemo(() => quarterData.vehicles
+    .filter((row) => quarterQualityFilter === 'All' || (quarterQualityFilter === 'Incomplete'
+      ? row.approvedMonths < row.expectedMonths : row.qualityIssues.length > 0))
+    .slice()
+    .sort((a, b) => Number(a.ready) - Number(b.ready) || b.qualityIssues.length - a.qualityIssues.length || a.vehicle.unit.localeCompare(b.vehicle.unit)), [quarterData.vehicles, quarterQualityFilter])
 
   useEffect(() => {
-    const vehicle = filteredVehicles.find((item) => item.id === reportVehicleId && item.status !== 'Retired') ??
-      filteredVehicles.find((item) => item.status !== 'Retired')
+    const vehicle = filteredVehicles.find((item) => item.id === reportVehicleId && requiresMonthlyReport(item, period)) ??
+      filteredVehicles.find((item) => requiresMonthlyReport(item, period))
     setReportVehicleId(vehicle?.id ?? '')
     setReportDraft(reportDraftFor(fleet, vehicle, period))
     // The form should refresh on filter/period changes, not on unrelated audit events.
@@ -628,18 +806,24 @@ export default function FleetApp() {
     setReportDraft(reportDraftFor(fleetRef.current, vehicle, targetPeriod))
     setReportsTab('submit')
     changePage('reports')
+    setFocusTarget('fleet-report-form')
   }
 
   const openReview = (reportId: string, targetPeriod = period) => {
+    const report = fleetRef.current.reports.find((item) => item.id === reportId)
+    const vehicle = report && fleetRef.current.vehicles.find((item) => item.id === report.vehicleId)
+    if (vehicle && department !== 'All departments' && department !== vehicle.department) setDepartment('All departments')
     if (targetPeriod !== period) setPeriod(targetPeriod)
     setSelectedReviewId(reportId)
     setReportsTab('review')
     changePage('reports')
+    setFocusTarget('fleet-review-item-' + reportId)
   }
 
   const openTicket = (ticketId?: string, vehicleId?: string) => {
     if (ticketId) {
       setSelectedTicketId(ticketId)
+      setExpandedTicketHistoryId(ticketId)
       setTicketFilter('All')
       setTicketFormOpen(false)
       const ticket = fleetRef.current.tickets.find((candidate) => candidate.id === ticketId)
@@ -649,12 +833,36 @@ export default function FleetApp() {
         const vehicle = fleetRef.current.vehicles.find((candidate) => candidate.id === ticket.vehicleId)
         if (vehicle && department !== 'All departments' && department !== vehicle.department) setDepartment(vehicle.department)
       }
+      setFocusTarget('fleet-ticket-' + ticketId)
     } else if (vehicleId) {
       setTicketDraft(blankTicketDraft(vehicleId))
       setTicketFormOpen(true)
       setSelectedTicketId(null)
+      setExpandedTicketHistoryId(null)
+      setFocusTarget('fleet-new-ticket-form')
     }
     changePage('maintenance')
+  }
+
+  const openVehicle = (vehicleId: string) => {
+    const vehicle = fleetRef.current.vehicles.find((item) => item.id === vehicleId)
+    if (!vehicle) return
+    if (department !== 'All departments' && department !== vehicle.department) setDepartment(vehicle.department)
+    setSelectedVehicleId(vehicleId)
+    changePage('vehicles')
+    setFocusTarget('fleet-vehicle-detail')
+  }
+
+  const openReportHistory = (reportId: string) => {
+    const report = fleetRef.current.reports.find((item) => item.id === reportId)
+    if (!report) return
+    const vehicle = fleetRef.current.vehicles.find((item) => item.id === report.vehicleId)
+    if (vehicle && department !== 'All departments' && department !== vehicle.department) setDepartment(vehicle.department)
+    setPeriod(report.period)
+    setExpandedReportId(reportId)
+    setReportsTab('history')
+    changePage('reports')
+    setFocusTarget('fleet-history-report-' + reportId)
   }
 
   const exceptionAction = (item: FleetException) => {
@@ -667,8 +875,7 @@ export default function FleetApp() {
       openTicket(linkedTicket?.id, linkedTicket ? undefined : item.vehicleId)
     }
     else {
-      setSelectedVehicleId(item.vehicleId)
-      changePage('vehicles')
+      openVehicle(item.vehicleId)
     }
   }
 
@@ -695,16 +902,48 @@ export default function FleetApp() {
   const beginFollowUp = (item: FleetException) => {
     setFollowUpFor(item.id)
     setFollowUpNote('')
+    setFollowUpOwner(item.owner ?? 'Demo Fleet Coordinator')
+    setFollowUpDueOn(localDateOffset(3))
   }
 
   const handleFollowUp = (event: FormEvent<HTMLFormElement>, item: FleetException) => {
     event.preventDefault()
     if (commit(
-      (current) => recordReportFollowUp(current, item.vehicleId, period, followUpActor, followUpNote),
-      'Follow-up recorded in the local audit trail. No message was sent.',
+      (current) => recordReportFollowUp(current, item.vehicleId, period, followUpActor, followUpNote, followUpDueOn, followUpOwner),
+      'Internal follow-up task created. No reminder or message was sent.',
     )) {
       setFollowUpFor(null)
       setFollowUpNote('')
+      setShowClosedFollowUps(false)
+      const newest = fleetRef.current.followUps.find((task) => task.vehicleId === item.vehicleId && task.period === period && task.status !== 'Closed')
+      if (newest) setFocusTarget('fleet-follow-up-task-' + newest.id)
+    }
+  }
+
+  const beginTaskEdit = (task: FollowUp) => {
+    setShowClosedFollowUps(false)
+    setEditingFollowUpId(task.id)
+    setTaskActor(task.actor || 'Demo Fleet Coordinator')
+    setTaskOwner(task.owner || task.actor)
+    setTaskDueOn(task.dueOn || localDateOffset(3))
+    setTaskOutcome('')
+    setFocusTarget('fleet-follow-up-task-' + task.id)
+  }
+
+  const saveTask = (task: FollowUp, close = false) => {
+    if (close && taskOutcome.trim().length < 5) {
+      toast('Describe the outcome before closing the follow-up task.', 'error')
+      return
+    }
+    const options = { owner: taskOwner, dueOn: taskDueOn, ...(close ? { outcome: taskOutcome } : {}) }
+    if (commit(
+      (current) => updateReportFollowUp(current, task.id, close ? 'Closed' : 'Open', taskActor, options),
+      close ? 'Internal follow-up closed with outcome. Nothing was sent.' : 'Internal follow-up owner and due date updated.',
+    )) {
+      setEditingFollowUpId(null)
+      setTaskOutcome('')
+      setShowClosedFollowUps(close)
+      setFocusTarget('fleet-follow-up-task-' + task.id)
     }
   }
 
@@ -759,16 +998,35 @@ export default function FleetApp() {
       toast('Add a resolution note before resolving the issue.', 'error')
       return
     }
+    if (serviceEdit.status !== 'Open' && !serviceEdit.assignee.trim()) {
+      toast('Assign a technician or responsible team before scheduling or resolving work.', 'error')
+      return
+    }
+    if (serviceEdit.status === 'Scheduled' && !serviceEdit.scheduledFor) {
+      toast('Set a scheduled service date.', 'error')
+      return
+    }
+    if (ticket.status === 'Resolved' && serviceEdit.status !== 'Resolved' && serviceEdit.reopenReason.trim().length < 5) {
+      toast('Explain why the resolved work order is being reopened.', 'error')
+      return
+    }
     const details = {
       assignee: serviceEdit.assignee,
       scheduledFor: serviceEdit.scheduledFor,
       resolutionNote: serviceEdit.resolutionNote,
       actualCost: serviceEdit.actualCost.trim() ? Number(serviceEdit.actualCost) : undefined,
+      reopenReason: serviceEdit.reopenReason,
     }
     if (commit(
       (current) => updateMaintenanceTicket(current, ticket.id, serviceEdit.status, 'Demo ' + role, details),
       ticket.title + ' updated with service follow-through.',
-    )) setServiceEditId(null)
+    )) {
+      setServiceEditId(null)
+      setTicketFilter('All')
+      setExpandedTicketHistoryId(ticket.id)
+      setSelectedTicketId(ticket.id)
+      setFocusTarget('fleet-ticket-' + ticket.id)
+    }
   }
 
   const handleReportSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -884,6 +1142,39 @@ export default function FleetApp() {
     else openReport(vehicle.id, targetPeriod)
   }
 
+  const openQuarterQualityIssue = (vehicle: Vehicle, issue: string) => {
+    const month = issue.match(/^(\d{4}-(?:0[1-9]|1[0-2])):/)?.[1]
+    const report = month ? activeReportFor(fleetRef.current, vehicle.id, month) : undefined
+    if (report) openReportHistory(report.id)
+    else openVehicle(vehicle.id)
+  }
+
+  const beginApprovedCorrection = (vehicle: Vehicle, issue: string) => {
+    const month = issue.match(/^(\d{4}-(?:0[1-9]|1[0-2])):/)?.[1]
+    const report = month ? activeReportFor(fleetRef.current, vehicle.id, month) : undefined
+    if (!report || report.status !== 'Approved') {
+      toast('An approved source report could not be found for this quality finding.', 'error')
+      return
+    }
+    setCorrectionRequest({ reportId: report.id, vehicleId: vehicle.id, period: report.period, reason: '' })
+  }
+
+  const submitApprovedCorrection = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!correctionRequest) return
+    if (correctionRequest.reason.trim().length < 5) {
+      toast('Record why the approved report needs a correction.', 'error')
+      return
+    }
+    if (commit(
+      (current) => reopenApprovedReportForCorrection(current, correctionRequest.reportId, 'Demo ' + role, correctionRequest.reason),
+      'Approved snapshot retained. Report reopened for correction in the local demo.',
+    )) {
+      const { vehicleId, period: targetPeriod } = correctionRequest
+      setCorrectionRequest(null)
+      openReport(vehicleId, targetPeriod)
+    }
+  }
   const resetDemo = () => {
     if (!window.confirm('Reset FleetSync to fictional sample records? Your changes saved in this browser will be replaced.')) return
     const next = createDemoFleet(currentPeriod())
@@ -900,14 +1191,22 @@ export default function FleetApp() {
     setEditingDepartment(null)
     setFollowUpFor(null)
     setExceptionFilter('All')
+    setEditingFollowUpId(null)
+    setShowClosedFollowUps(false)
     setVehicleEditId(null)
     setServiceEditId(null)
     setQuarterScope(fiscalQuarterForPeriod(currentPeriod()))
+    setQuarterQualityFilter('All')
+    setExpandedQualityVehicleId(null)
+    setCorrectionRequest(null)
+    setExpandedReportId(null)
+    setTicketFilter('Active')
     setVehicleSearch('')
     setAuditSearch('')
     setShowAllExceptions(false)
     setSelectedVehicleId(next.vehicles[0]?.id ?? null)
     setSelectedTicketId(null)
+    setExpandedTicketHistoryId(null)
     setTicketDraft(blankTicketDraft(next.vehicles[0]?.id))
     setMobileNavOpen(false)
   }
@@ -1007,7 +1306,7 @@ export default function FleetApp() {
                 <h1>{view === 'overview' ? 'Exceptions and reporting' : navCurrent.label}</h1>
                 <p>
                   {view === 'overview' && 'Open actions, department reporting deadlines, and unresolved service work.'}
-                  {view === 'reports' && 'Submit mileage and condition records. Approve or return department reports.'}
+                  {view === 'reports' && role !== 'Driver' && 'Submit mileage and condition records. Approve or return department reports.'}
                   {view === 'vehicles' && 'Vehicle details, assigned departments, custodians, and service status.'}
                   {view === 'maintenance' && 'Assign, schedule, and document vehicle maintenance work.'}
                   {view === 'exports' && 'Reconcile three monthly periods and prepare review-only CSV worksheets.'}
@@ -1057,6 +1356,7 @@ export default function FleetApp() {
                     { label: 'Overdue reporting', value: metrics.overdue, detail: metrics.missing + ' missing' },
                     { label: 'Supervisor queue', value: metrics.pending, detail: metrics.returned + ' returned' },
                     { label: 'Open work orders', value: metrics.tickets, detail: metrics.serviceHolds + ' service holds' },
+                    { label: 'Follow-up tasks', value: openFollowUpTasks.length, detail: overdueFollowUps + ' overdue' },
                   ].map((item) => (
                     <div className="fleet-ops-summary__item" key={item.label}>
                       <span className="fleet-ops-summary__label">{item.label}</span>
@@ -1084,6 +1384,7 @@ export default function FleetApp() {
                             const vehicle = fleet.vehicles.find((candidate) => candidate.id === item.vehicleId)
                             const isReporting = /missing|overdue report|approval|returned/i.test(item.type)
                             const actionLabel = /approval/i.test(item.type) ? 'Review' : /returned/i.test(item.type) ? 'Correct' : /missing|overdue report/i.test(item.type) ? 'Submit' : /service hold/i.test(item.type) ? 'View unit' : 'Manage'
+                            const activeTask = openFollowUpTasks.find((task) => task.vehicleId === item.vehicleId && task.period === period)
                             return (
                               <Fragment key={item.id}>
                                 <tr className={'fleet-exception-row fleet-exception-row--' + item.priority.toLowerCase()}>
@@ -1094,7 +1395,9 @@ export default function FleetApp() {
                                   <td>{item.dueDate ? dateLabel(item.dueDate) : '—'}{typeof item.daysOverdue === 'number' && item.daysOverdue > 0 && <small className="fleet-table__meta fleet-urgency">{item.daysOverdue} days overdue</small>}</td>
                                   <td><div className="fleet-exception__actions">
                                     <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => exceptionAction(item)} aria-label={actionLabel + ' for ' + item.label}>{actionLabel} <ArrowRight size={14} /></button>
-                                    {isReporting && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" aria-expanded={followUpFor === item.id} onClick={() => followUpFor === item.id ? setFollowUpFor(null) : beginFollowUp(item)}>Follow-up</button>}
+                                    {isReporting && (activeTask
+                                      ? <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => beginTaskEdit(activeTask)}>Manage task</button>
+                                      : <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" aria-expanded={followUpFor === item.id} onClick={() => followUpFor === item.id ? setFollowUpFor(null) : beginFollowUp(item)}>Create follow-up</button>)}
                                   </div></td>
                                 </tr>
                                 {followUpFor === item.id && (
@@ -1103,9 +1406,11 @@ export default function FleetApp() {
                                       <div className="fleet-profile-form__heading"><h3>Record internal follow-up · {item.label}</h3><button type="button" className="fleet-icon-button" aria-label="Close follow-up form" onClick={() => setFollowUpFor(null)}><X size={17} /></button></div>
                                       <div className="fleet-form-grid">
                                         <Field htmlFor={'follow-actor-' + item.id} label="Recorded by"><input id={'follow-actor-' + item.id} className="fleet-input" value={followUpActor} maxLength={80} minLength={2} required onChange={(event) => setFollowUpActor(event.target.value)} /></Field>
-                                        <Field htmlFor={'follow-note-' + item.id} label="Follow-up note" hint="Audit note only. No email, SMS, or task notification is sent." className="fleet-field--full"><textarea id={'follow-note-' + item.id} className="fleet-textarea" value={followUpNote} rows={2} minLength={5} maxLength={400} required placeholder="Record contact attempt, response, or next step" onChange={(event) => setFollowUpNote(event.target.value)} /></Field>
+                                        <Field htmlFor={'follow-owner-' + item.id} label="Responsible owner"><input id={'follow-owner-' + item.id} className="fleet-input" value={followUpOwner} minLength={2} maxLength={80} required onChange={(event) => setFollowUpOwner(event.target.value)} /></Field>
+                                        <Field htmlFor={'follow-due-' + item.id} label="Next check-in date"><input id={'follow-due-' + item.id} className="fleet-input" type="date" min={localDateOffset(0)} value={followUpDueOn} required onChange={(event) => setFollowUpDueOn(event.target.value)} /></Field>
+                                        <Field htmlFor={'follow-note-' + item.id} label="Internal task note" hint="This schedules a local task, not an email, SMS, or external reminder." className="fleet-field--full"><textarea id={'follow-note-' + item.id} className="fleet-textarea" value={followUpNote} rows={2} minLength={5} maxLength={400} required placeholder="Record planned action and follow-up target" onChange={(event) => setFollowUpNote(event.target.value)} /></Field>
                                       </div>
-                                      <div className="fleet-form-actions"><button className="fleet-button fleet-button--primary fleet-button--small" type="submit"><Check size={15} /> Save note</button><button className="fleet-button fleet-button--quiet fleet-button--small" type="button" onClick={() => setFollowUpFor(null)}>Cancel</button></div>
+                                      <div className="fleet-form-actions"><button className="fleet-button fleet-button--primary fleet-button--small" type="submit"><Check size={15} /> Create internal task</button><button className="fleet-button fleet-button--quiet fleet-button--small" type="button" onClick={() => setFollowUpFor(null)}>Cancel</button></div>
                                     </form>
                                   </td></tr>
                                 )}
@@ -1118,6 +1423,71 @@ export default function FleetApp() {
                     {displayedExceptions.length > 6 && <button className="fleet-button fleet-button--quiet fleet-button--block" type="button" onClick={() => setShowAllExceptions((value) => !value)}>{showAllExceptions ? 'Show fewer exceptions' : 'Show all ' + displayedExceptions.length + ' exceptions'} <ChevronDown size={16} /></button>}
                   </FleetCard>
                 </div>
+
+                <FleetCard className="fleet-follow-up-queue" >
+                  <SectionTitle
+                    title="Internal follow-up tasks"
+                    description="Locally tracked actions with named owners, due dates, and recorded outcomes. Creating or closing a task does not send a reminder."
+                    action={<Tone tone={overdueFollowUps ? 'high' : 'muted'}>{openFollowUpTasks.length} open · {overdueFollowUps} overdue</Tone>}
+                  />
+                  <div className="fleet-exception-toolbar" role="group" aria-label="Follow-up task status">
+                    <button className={'fleet-button fleet-button--small ' + (!showClosedFollowUps ? 'fleet-button--primary' : 'fleet-button--quiet')} type="button" aria-pressed={!showClosedFollowUps} onClick={() => setShowClosedFollowUps(false)}>Open ({openFollowUpTasks.length})</button>
+                    <button className={'fleet-button fleet-button--small ' + (showClosedFollowUps ? 'fleet-button--primary' : 'fleet-button--quiet')} type="button" aria-pressed={showClosedFollowUps} onClick={() => setShowClosedFollowUps(true)}>Closed ({closedFollowUpTasks.length})</button>
+                  </div>
+                  {visibleFollowUpTasks.length ? (
+                    <div className="fleet-table-wrap">
+                      <table className="fleet-table fleet-follow-up-table">
+                        <thead><tr><th scope="col">Unit / month</th><th scope="col">Owner</th><th scope="col">Due / completed</th><th scope="col">Task / outcome</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
+                        <tbody>
+                          {visibleFollowUpTasks.map((task) => {
+                            const vehicle = fleet.vehicles.find((item) => item.id === task.vehicleId)
+                            const closed = task.status === 'Closed'
+                            const overdue = !closed && Boolean(task.dueOn && task.dueOn < localDateOffset(0))
+                            return (
+                              <Fragment key={task.id}>
+                                <tr id={'fleet-follow-up-task-' + task.id} tabIndex={-1} className={'fleet-follow-up-row fleet-record-anchor ' + (overdue ? 'is-overdue' : '')}>
+                                  <td><strong>{vehicle?.unit ?? task.vehicleId}</strong><small className="fleet-table__meta">{displayPeriod(task.period)} · {vehicle?.department}</small></td>
+                                  <td>{task.owner || task.actor}</td>
+                                  <td>{closed ? dateLabel(task.closedAt ?? task.at) : task.dueOn ? dateLabel(task.dueOn) : 'Unscheduled'}{overdue && <small className="fleet-table__meta fleet-urgency">Overdue</small>}</td>
+                                  <td><strong>{task.note}</strong>{task.outcome && <small className="fleet-table__meta">Outcome: {task.outcome}</small>}{closed && task.closedBy && <small className="fleet-table__meta">Closed by {task.closedBy}</small>}</td>
+                                  <td><Tone tone={closed ? 'approved' : overdue ? 'high' : 'pending'}>{closed ? 'Closed' : 'Open'}</Tone></td>
+                                  <td><div className="fleet-exception__actions">
+                                    {!closed && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => beginTaskEdit(task)} aria-expanded={editingFollowUpId === task.id}>Update task</button>}
+                                    <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => {
+                                      const report = activeReportFor(fleet, task.vehicleId, task.period)
+                                      if (report?.status === 'Pending') openReview(report.id, task.period)
+                                      else if (report?.status === 'Approved') openReportHistory(report.id)
+                                      else openReport(task.vehicleId, task.period)
+                                    }}>Report <ArrowRight size={14} /></button>
+                                  </div></td>
+                                </tr>
+                                {editingFollowUpId === task.id && !closed && (
+                                  <tr className="fleet-follow-up-detail"><td colSpan={6}>
+                                    <form className="fleet-form fleet-follow-up-form" onSubmit={(event) => { event.preventDefault(); saveTask(task) }}>
+                                      <div className="fleet-profile-form__heading"><h3>Update follow-up · {vehicle?.unit ?? task.vehicleId}</h3><button className="fleet-icon-button" type="button" aria-label="Close task editor" onClick={() => setEditingFollowUpId(null)}><X size={18} /></button></div>
+                                      <div className="fleet-form-grid fleet-form-grid--wide">
+                                        <Field htmlFor={'task-editor-' + task.id} label="Updated by"><input id={'task-editor-' + task.id} className="fleet-input" minLength={2} maxLength={80} required value={taskActor} onChange={(event) => setTaskActor(event.target.value)} /></Field>
+                                        <Field htmlFor={'task-owner-' + task.id} label="Responsible owner"><input id={'task-owner-' + task.id} className="fleet-input" minLength={2} maxLength={80} required value={taskOwner} onChange={(event) => setTaskOwner(event.target.value)} /></Field>
+                                        <Field htmlFor={'task-due-' + task.id} label="Next check-in date"><input id={'task-due-' + task.id} className="fleet-input" type="date" value={taskDueOn} required onChange={(event) => setTaskDueOn(event.target.value)} /></Field>
+                                        <Field htmlFor={'task-outcome-' + task.id} label="Outcome or contact result (required to close)" className="fleet-field--full"><textarea id={'task-outcome-' + task.id} className="fleet-textarea" rows={2} minLength={5} maxLength={400} value={taskOutcome} onChange={(event) => setTaskOutcome(event.target.value)} placeholder="Record the actual response, completed action, or reason no action was taken" /></Field>
+                                      </div>
+                                      <p className="fleet-text-muted">This task has no scheduling service. No email, text, push notification, or external reminder will be sent.</p>
+                                      <div className="fleet-form-actions">
+                                        <button className="fleet-button fleet-button--quiet" type="submit">Save owner / due date</button>
+                                        <button className="fleet-button fleet-button--primary" type="button" disabled={taskOutcome.trim().length < 5 || taskActor.trim().length < 2} onClick={() => saveTask(task, true)}><Check size={16} /> Close with outcome</button>
+                                        <button className="fleet-button fleet-button--quiet" type="button" onClick={() => setEditingFollowUpId(null)}>Cancel</button>
+                                      </div>
+                                    </form>
+                                  </td></tr>
+                                )}
+                              </Fragment>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : <Empty icon={ClipboardCheck} title={showClosedFollowUps ? 'No closed follow-ups in this scope' : 'No open follow-up tasks'} description={showClosedFollowUps ? 'Resolved task outcomes will appear here.' : 'Create a task from a missing, overdue, or returned report exception. No automated messages are sent.'} />}
+                </FleetCard>
 
                 <FleetCard className="fleet-department-scorecard">
                   <SectionTitle title="Reporting by department" description="Assigned coordinator, due day, approval progress and overdue items. Due dates are configurable demo policy, not a verified university deadline." action={<Tone tone="muted">{scorecardVisible.length} departments</Tone>} />
@@ -1216,9 +1586,9 @@ export default function FleetApp() {
                 {reportsTab === 'submit' && (
                   <div role="tabpanel" aria-labelledby="fleet-report-submit-tab" className="fleet-grid fleet-reports-layout">
                     <FleetCard>
-                      <SectionTitle eyebrow="DRIVER WORKFLOW" title="Monthly vehicle use report" description={'Record vehicle activity for ' + displayPeriod(period) + '. This demo queues a supervisor review.'} />
-                      <div className="fleet-banner fleet-banner--info"><Info size={18} /><span>Enter the information for one vehicle. Returned reports can be corrected and resubmitted under the same record.</span></div>
-                      <form className="fleet-form" onSubmit={handleReportSubmit}>
+                      <SectionTitle eyebrow="DRIVER ENTRY" title="Monthly vehicle use report" description={role === 'Driver' ? undefined : 'Record vehicle activity for ' + displayPeriod(period) + '. A supervisor can approve or return the submission.'} />
+                      {role !== 'Driver' && <div className="fleet-banner fleet-banner--info"><Info size={18} /><span>Enter the information for one vehicle. Returned reports can be corrected and resubmitted under the same record.</span></div>}
+                      <form id="fleet-report-form" tabIndex={-1} className="fleet-form fleet-record-anchor" onSubmit={handleReportSubmit}>
                         <div className="fleet-form-grid">
                           <Field label="Vehicle / unit" htmlFor="fleet-report-vehicle" className="fleet-field--full">
                             <select className="fleet-select" id="fleet-report-vehicle" value={reportVehicleId} required onChange={(event) => {
@@ -1227,7 +1597,7 @@ export default function FleetApp() {
                               setReportVehicleId(id)
                               setReportDraft(reportDraftFor(fleet, vehicle, period))
                             }}>
-                              {filteredVehicles.filter((vehicle) => vehicle.status !== 'Retired').map((vehicle) => <option key={vehicle.id} value={vehicle.id}>{vehicle.unit} · {vehicle.year} {vehicle.make} {vehicle.model}</option>)}
+                              {filteredVehicles.filter((vehicle) => requiresMonthlyReport(vehicle, period)).map((vehicle) => <option key={vehicle.id} value={vehicle.id}>{vehicle.unit} · {vehicle.year} {vehicle.make} {vehicle.model}</option>)}
                             </select>
                           </Field>
                           <Field label="Starting odometer (miles)" htmlFor="fleet-report-start">
@@ -1286,6 +1656,8 @@ export default function FleetApp() {
                             <MetaLine label="Reporting month" value={displayPeriod(period)} />
                             <MetaLine label="Vehicle availability" value={<Tone tone={reportVehicle.status === 'Active' ? 'approved' : reportVehicle.status === 'Retired' ? 'muted' : 'high'}>{reportVehicle.status}</Tone>} />
                             <MetaLine label="Report status" value={reportExisting ? <Tone tone={reportExisting.status.toLowerCase()}>{reportExisting.status}</Tone> : <Tone tone="muted">Not submitted</Tone>} />
+                            {reportExisting && <MetaLine label="Recorded revision" value={'v' + reportExisting.revision + ' · ' + getReportHistory(fleet, reportExisting.id).length + ' history events'} />}
+                            {reportExisting && <button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => openReportHistory(reportExisting.id)}><History size={15} /> View revision history <ArrowRight size={14} /></button>}
                             {reportExisting?.status === 'Returned' && <div className="fleet-banner fleet-banner--warning"><AlertTriangle size={17} /><span><strong>Returned for correction</strong>{reportExisting.reviewNote && <small>{reportExisting.reviewNote}</small>}</span></div>}
                             {reportExisting?.status === 'Pending' && <div className="fleet-banner fleet-banner--info"><Clock3 size={17} /><span>Already submitted for this month. Awaiting supervisor review.</span></div>}
                             {reportExisting?.status === 'Approved' && <div className="fleet-banner fleet-banner--success"><CheckCircle2 size={17} /><span>This report is approved and locked for the current month.</span></div>}
@@ -1316,7 +1688,7 @@ export default function FleetApp() {
                         {pendingReports.map((report) => {
                           const vehicle = fleet.vehicles.find((candidate) => candidate.id === report.vehicleId)
                           return (
-                            <article className={'fleet-review-item ' + (selectedReviewId === report.id ? 'is-highlighted' : '')} key={report.id}>
+                            <article id={'fleet-review-item-' + report.id} tabIndex={-1} className={'fleet-review-item fleet-record-anchor ' + (selectedReviewId === report.id ? 'is-highlighted' : '')} key={report.id}>
                               <div className="fleet-review-item__heading">
                                 <div className="fleet-review-item__identity"><span className="fleet-review-item__icon"><Truck size={21} /></span><VehicleName vehicle={vehicle} /></div>
                                 <Tone tone="pending">Pending review</Tone>
@@ -1344,6 +1716,7 @@ export default function FleetApp() {
                               <div className="fleet-form-actions fleet-review-item__actions">
                                 <button type="button" className="fleet-button fleet-button--primary" onClick={() => handleReview(report.id, 'Approved')}><Check size={17} /> Approve report</button>
                                 <button type="button" className="fleet-button fleet-button--danger fleet-button--danger-outline" onClick={() => handleReview(report.id, 'Returned')}><ArrowLeft size={17} /> Return for correction</button>
+                                <button type="button" className="fleet-button fleet-button--quiet" onClick={() => openReportHistory(report.id)}><History size={16} /> Revision history</button>
                               </div>
                             </article>
                           )
@@ -1357,23 +1730,39 @@ export default function FleetApp() {
                     <SectionTitle eyebrow="MONTHLY RECORDS" title={displayPeriod(period) + ' reports'} description="All submitted reports for the selected scope, including returned records." action={<Tone tone="muted">{filteredReports.length} records</Tone>} />
                     <div className="fleet-table-wrap">
                       <table className="fleet-table">
-                        <thead><tr><th scope="col">Vehicle</th><th scope="col">Operator</th><th scope="col">Distance</th><th scope="col">Condition</th><th scope="col">Status</th><th scope="col">Action</th></tr></thead>
+                        <thead><tr><th scope="col">Vehicle</th><th scope="col">Operator</th><th scope="col">Distance</th><th scope="col">Condition</th><th scope="col">Status</th><th scope="col">Revision</th><th scope="col">Actions</th></tr></thead>
                         <tbody>
                           {filteredReports.map((report) => {
                             const vehicle = fleet.vehicles.find((item) => item.id === report.vehicleId)
+                            const qualityIssues = getReportQualityIssues(fleet, report.id)
                             return (
-                              <tr key={report.id}>
-                                <td><VehicleName vehicle={vehicle} /></td>
-                                <td>{report.operator}<small className="fleet-table__meta">{timestamp(report.submittedAt)}</small></td>
-                                <td>{whole(report.endOdometer - report.startOdometer)} mi</td>
-                                <td><Tone tone={report.condition === 'Good' ? 'approved' : report.condition === 'Unsafe' ? 'high' : 'medium'}>{report.condition}</Tone></td>
-                                <td><Tone tone={report.status.toLowerCase()}>{report.status}</Tone></td>
-                                <td>
-                                  {report.status === 'Returned' && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => openReport(report.vehicleId)}>Correct <ArrowRight size={15} /></button>}
-                                  {report.status === 'Pending' && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => openReview(report.id)}>Review <ArrowRight size={15} /></button>}
-                                  {report.status === 'Approved' && <span className="fleet-table__muted">Complete</span>}
-                                </td>
-                              </tr>
+                              <Fragment key={report.id}>
+                                <tr id={'fleet-history-report-' + report.id} tabIndex={-1} className={'fleet-record-anchor ' + (expandedReportId === report.id ? 'is-highlighted' : '')}>
+                                  <td><VehicleName vehicle={vehicle} /></td>
+                                  <td>{report.operator}<small className="fleet-table__meta">{timestamp(report.submittedAt)}</small></td>
+                                  <td>{whole(report.endOdometer - report.startOdometer)} mi</td>
+                                  <td><Tone tone={report.condition === 'Good' ? 'approved' : report.condition === 'Unsafe' ? 'high' : 'medium'}>{report.condition}</Tone></td>
+                                  <td><Tone tone={report.status.toLowerCase()}>{report.status}</Tone>{qualityIssues.length > 0 && <small className="fleet-table__meta fleet-urgency">{qualityIssues.length} data checks</small>}</td>
+                                  <td><strong>v{report.revision}</strong><small className="fleet-table__meta">{getReportHistory(fleet, report.id).length} events</small></td>
+                                  <td><div className="fleet-form-actions">
+                                    {report.status === 'Returned' && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => openReport(report.vehicleId)}>Correct <ArrowRight size={15} /></button>}
+                                    {report.status === 'Pending' && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => openReview(report.id)}>Review <ArrowRight size={15} /></button>}
+                                    <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" aria-expanded={expandedReportId === report.id} onClick={() => setExpandedReportId((current) => current === report.id ? null : report.id)}>
+                                      <History size={15} /> {expandedReportId === report.id ? 'Hide history' : 'History'}
+                                    </button>
+                                  </div></td>
+                                </tr>
+                                {expandedReportId === report.id && <tr className="fleet-history-expanded"><td colSpan={7}>
+                                  {qualityIssues.length > 0 && <section className="fleet-quality-issues" aria-label="Report data-quality findings"><h4>Data-quality checks</h4><ul>{qualityIssues.map((issue, i) => <li key={i}>{issue}</li>)}</ul><p className="fleet-text-muted">Approved records are not edited silently. Reopening a record for correction retains this approved snapshot.</p><button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => {
+                                    setQuarterScope(fiscalQuarterForPeriod(report.period))
+                                    setQuarterQualityFilter('Quality')
+                                    setExpandedQualityVehicleId(report.vehicleId)
+                                    changePage('exports')
+                                    setFocusTarget('fleet-quarter-quality-' + report.vehicleId)
+                                  }}>Review correction options <ArrowRight size={14} /></button></section>}
+                                  <ReportHistoryLedger entries={getReportHistory(fleet, report.id)} />
+                                </td></tr>}
+                              </Fragment>
                             )
                           })}
                         </tbody>
@@ -1431,7 +1820,7 @@ export default function FleetApp() {
                     {!filteredVehicles.length && <Empty icon={Truck} title="No vehicles in this scope" description="Select another department or add a vehicle." />}
                     {filteredVehicles.length > 0 && !filteredVehicles.some((vehicle) => [vehicle.unit, vehicle.make, vehicle.model, vehicle.plate, vehicle.custodian, vehicle.department].some((field) => field.toLowerCase().includes(vehicleSearch.trim().toLowerCase()))) && <Empty icon={Search} title="No matching vehicles" description="Try another search or clear the search field." />}
                   </FleetCard>
-                  <FleetCard className="fleet-vehicle-detail">
+                  <FleetCard id="fleet-vehicle-detail" className="fleet-vehicle-detail">
                     {selectedVehicle && filteredIds.has(selectedVehicle.id) ? (
                       <>
                         <div className="fleet-vehicle-detail__hero"><span className="fleet-vehicle-detail__icon"><Truck size={33} strokeWidth={1.5} /></span><Tone tone={selectedVehicle.status === 'Active' ? 'approved' : selectedVehicle.status === 'Retired' ? 'muted' : 'medium'}>{selectedVehicle.status}</Tone></div>
@@ -1449,6 +1838,24 @@ export default function FleetApp() {
                           <MetaLine label="Service issues" value={fleet.tickets.filter((ticket) => ticket.vehicleId === selectedVehicle.id && ticket.status !== 'Resolved').length + ' open'} />
                         </div>
                         <div className="fleet-vehicle-detail__actions"><button type="button" className="fleet-button fleet-button--primary" onClick={() => openReport(selectedVehicle.id)}><FileText size={16} /> Monthly report</button><button type="button" className="fleet-button fleet-button--quiet" onClick={() => openTicket(undefined, selectedVehicle.id)}><Wrench size={16} /> Raise issue</button><button type="button" className="fleet-button fleet-button--quiet" onClick={() => vehicleEditId === selectedVehicle.id ? setVehicleEditId(null) : beginVehicleEdit(selectedVehicle)} aria-expanded={vehicleEditId === selectedVehicle.id}><Pencil size={16} /> Edit vehicle</button></div>
+                        <section className="fleet-vehicle-report-history" aria-label={'Monthly report versions for ' + selectedVehicle.unit}>
+                          <div className="fleet-profile-form__heading"><h3>Monthly report versions</h3><span className="fleet-text-muted">Latest six months</span></div>
+                          {fleet.reports.some((report) => report.vehicleId === selectedVehicle.id) ? (
+                            <div className="fleet-table-wrap">
+                              <table className="fleet-table">
+                                <thead><tr><th scope="col">Month</th><th scope="col">Status</th><th scope="col">Revision</th><th scope="col">Action</th></tr></thead>
+                                <tbody>{fleet.reports.filter((report) => report.vehicleId === selectedVehicle.id).sort((a, b) => b.period.localeCompare(a.period)).slice(0, 6).map((report) => (
+                                  <tr key={report.id}>
+                                    <td>{displayPeriod(report.period)}</td>
+                                    <td><Tone tone={report.status.toLowerCase()}>{report.status}</Tone></td>
+                                    <td>v{report.revision}<small className="fleet-table__meta">{getReportHistory(fleet, report.id).length} events</small></td>
+                                    <td><button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => openReportHistory(report.id)}><History size={14} /> Open ledger</button></td>
+                                  </tr>
+                                ))}</tbody>
+                              </table>
+                            </div>
+                          ) : <p className="fleet-text-muted">No monthly reports have been recorded for this vehicle.</p>}
+                        </section>
                         {vehicleEditId === selectedVehicle.id && (
                           <form className="fleet-form fleet-vehicle-edit-form" onSubmit={handleVehicleEdit}>
                             <div className="fleet-profile-form__heading"><h3>Edit {selectedVehicle.unit} details</h3><button type="button" className="fleet-icon-button" aria-label="Cancel vehicle edit" onClick={() => setVehicleEditId(null)}><X size={18} /></button></div>
@@ -1501,7 +1908,7 @@ export default function FleetApp() {
                         const daysOpen = elapsedDays(ticket.createdAt)
                         const serviceOverdue = ticket.status === 'Scheduled' && ticket.scheduledFor && ticket.scheduledFor < new Date().toISOString().slice(0, 10)
                         return (
-                          <article className={'fleet-ticket ' + (selectedTicketId === ticket.id ? 'is-highlighted' : '') + (serviceOverdue ? ' is-overdue' : '')} key={ticket.id}>
+                          <article id={'fleet-ticket-' + ticket.id} tabIndex={-1} className={'fleet-ticket fleet-record-anchor ' + (selectedTicketId === ticket.id ? 'is-highlighted' : '') + (serviceOverdue ? ' is-overdue' : '')} key={ticket.id}>
                             <div className="fleet-ticket__top"><div><span className="fleet-ticket__unit">{vehicle?.unit ?? ticket.vehicleId} · {vehicle?.department}</span><h3>{ticket.title}</h3></div><Tone tone={ticket.severity.toLowerCase()}>{ticket.severity} priority</Tone></div>
                             <p>{ticket.description}</p>
                             <div className="fleet-ticket__meta">
@@ -1516,20 +1923,24 @@ export default function FleetApp() {
                             <div className="fleet-ticket__bottom">
                               <Tone tone={ticket.status.toLowerCase()}>{ticket.status}</Tone>
                               <button type="button" className="fleet-button fleet-button--small fleet-button--quiet" onClick={() => serviceEditId === ticket.id ? setServiceEditId(null) : beginServiceEdit(ticket)} aria-expanded={serviceEditId === ticket.id}><Settings2 size={16} /> {serviceEditId === ticket.id ? 'Close editor' : 'Update work'} <ChevronDown size={15} /></button>
+                              <button type="button" className="fleet-button fleet-button--small fleet-button--quiet" aria-expanded={expandedTicketHistoryId === ticket.id} onClick={() => setExpandedTicketHistoryId((id) => id === ticket.id ? null : ticket.id)}><History size={15} /> {expandedTicketHistoryId === ticket.id ? 'Hide activity' : 'Activity (' + getTicketHistory(fleet, ticket.id).length + ')'}</button>
+                              {ticket.sourceReportId && <button type="button" className="fleet-button fleet-button--small fleet-button--quiet" onClick={() => openReportHistory(ticket.sourceReportId!)}>Source report <ArrowRight size={14} /></button>}
                             </div>
                             {serviceEditId === ticket.id && (
                               <form className="fleet-form fleet-maintenance-editor" onSubmit={(event) => handleServiceUpdate(event, ticket)}>
                                 <div className="fleet-maintenance-editor__heading"><h4>Service follow-through</h4><p>Changes are recorded in the local audit. A resolved ticket still requires an explicit administrative release from any vehicle service hold.</p></div>
                                 <div className="fleet-form-grid">
                                   <Field label="Work status" htmlFor={'fleet-service-status-' + ticket.id}><select id={'fleet-service-status-' + ticket.id} className="fleet-select" value={serviceEdit.status} onChange={(event) => setServiceEdit((draft) => ({ ...draft, status: event.target.value as TicketStatus }))}>{TICKET_STATUSES.map((status) => <option key={status}>{status}</option>)}</select></Field>
-                                  <Field label="Assigned technician / team" htmlFor={'fleet-service-assignee-' + ticket.id}><input id={'fleet-service-assignee-' + ticket.id} className="fleet-input" maxLength={80} value={serviceEdit.assignee} placeholder="Garage team" onChange={(event) => setServiceEdit((draft) => ({ ...draft, assignee: event.target.value }))} /></Field>
+                                  <Field label="Assigned technician / team" htmlFor={'fleet-service-assignee-' + ticket.id}><input id={'fleet-service-assignee-' + ticket.id} className="fleet-input" maxLength={80} required={serviceEdit.status !== 'Open'} value={serviceEdit.assignee} placeholder="Garage team" onChange={(event) => setServiceEdit((draft) => ({ ...draft, assignee: event.target.value }))} /></Field>
                                   <Field label="Scheduled service date" htmlFor={'fleet-service-date-' + ticket.id}><input id={'fleet-service-date-' + ticket.id} className="fleet-input" type="date" value={serviceEdit.scheduledFor} required={serviceEdit.status === 'Scheduled'} onChange={(event) => setServiceEdit((draft) => ({ ...draft, scheduledFor: event.target.value }))} /></Field>
                                   <Field label="Actual service cost (USD)" htmlFor={'fleet-service-cost-' + ticket.id}><input id={'fleet-service-cost-' + ticket.id} className="fleet-input" type="number" min={0} step="0.01" value={serviceEdit.actualCost} placeholder="Optional" onChange={(event) => setServiceEdit((draft) => ({ ...draft, actualCost: event.target.value }))} /></Field>
                                   <Field label="Repair outcome / resolution note" htmlFor={'fleet-service-resolution-' + ticket.id} hint="Required when marking resolved. Record the action performed and any follow-up." className="fleet-field--full"><textarea id={'fleet-service-resolution-' + ticket.id} className="fleet-textarea" maxLength={1000} rows={3} required={serviceEdit.status === 'Resolved'} value={serviceEdit.resolutionNote} placeholder="Explain service performed, parts, testing, or next steps" onChange={(event) => setServiceEdit((draft) => ({ ...draft, resolutionNote: event.target.value }))} /></Field>
+                                  {ticket.status === 'Resolved' && serviceEdit.status !== 'Resolved' && <Field label="Reason for reopening (required)" htmlFor={'fleet-service-reopen-' + ticket.id} className="fleet-field--full"><textarea id={'fleet-service-reopen-' + ticket.id} className="fleet-textarea" rows={2} minLength={5} maxLength={400} required value={serviceEdit.reopenReason} placeholder="Describe what additional work or symptoms require reopening" onChange={(event) => setServiceEdit((draft) => ({ ...draft, reopenReason: event.target.value }))} /></Field>}
                                 </div>
                                 <div className="fleet-form-actions"><button className="fleet-button fleet-button--primary" type="submit"><Check size={16} /> Save service update</button><button type="button" className="fleet-button fleet-button--quiet" onClick={() => setServiceEditId(null)}>Cancel</button></div>
                               </form>
                             )}
+                            {expandedTicketHistoryId === ticket.id && <TicketHistoryLedger entries={getTicketHistory(fleet, ticket.id)} />}
                           </article>
                         )
                       })}
@@ -1540,7 +1951,7 @@ export default function FleetApp() {
                     {ticketFormOpen && (
                       <FleetCard className="fleet-create-card">
                         <SectionTitle eyebrow="NEW SERVICE ISSUE" title="Create a maintenance ticket" action={<button type="button" className="fleet-icon-button" aria-label="Close maintenance issue form" onClick={() => setTicketFormOpen(false)}><X size={19} /></button>} />
-                        <form className="fleet-form" onSubmit={handleAddTicket}>
+                        <form id="fleet-new-ticket-form" tabIndex={-1} className="fleet-form fleet-record-anchor" onSubmit={handleAddTicket}>
                           <Field label="Vehicle" htmlFor="fleet-new-ticket-vehicle"><select className="fleet-select" id="fleet-new-ticket-vehicle" value={ticketDraft.vehicleId} required onChange={(event) => setTicketDraft((draft) => ({ ...draft, vehicleId: event.target.value }))}>{filteredVehicles.map((vehicle) => <option key={vehicle.id} value={vehicle.id}>{vehicle.unit} · {vehicle.make} {vehicle.model}</option>)}</select></Field>
                           <Field label="Issue title" htmlFor="fleet-new-ticket-title"><input className="fleet-input" id="fleet-new-ticket-title" maxLength={100} required value={ticketDraft.title} placeholder="e.g. Brake system inspection" onChange={(event) => setTicketDraft((draft) => ({ ...draft, title: event.target.value }))} /></Field>
                           <Field label="Severity" htmlFor="fleet-new-ticket-severity"><select className="fleet-select" id="fleet-new-ticket-severity" value={ticketDraft.severity} onChange={(event) => setTicketDraft((draft) => ({ ...draft, severity: event.target.value as Severity }))}>{SEVERITIES.map((severity) => <option key={severity}>{severity}</option>)}</select></Field>
@@ -1593,35 +2004,44 @@ export default function FleetApp() {
                     <span className="fleet-quarterly-controls__due"><CalendarDays size={17} /> Statutory quarterly filing window: {dateLabel(quarterData.windowOpens)} – {dateLabel(quarterData.dueDate)} (45–60 days after quarter end)</span>
                   </div>
                   <div className="fleet-quarterly-stats" aria-label="Quarterly completeness totals">
-                    <div><strong>{quarterData.completion}%</strong><span>Month records approved</span></div>
+                    <div><strong>{quarterData.expected ? quarterData.completion + '%' : 'N/A'}</strong><span>Month records approved</span></div>
                     <div><strong>{quarterData.approved}/{quarterData.expected}</strong><span>Approved / expected</span></div>
-                    <div><strong>{quarterData.readyVehicles}/{quarterData.vehicles.length}</strong><span>Vehicles complete (all 3)</span></div>
+                    <div><strong>{quarterData.readyVehicles}/{quarterData.vehicles.length}</strong><span>Units reconciled for required months</span></div>
                     <div><strong>{quarterData.missing + quarterData.returned + quarterData.pending}</strong><span>Gaps to reconcile</span></div>
+                    <div className="fleet-quarterly-quality"><strong>{quarterData.dataQualityIssues}</strong><span>Data quality findings ({quarterData.vehiclesWithQualityIssues} units)</span></div>
                   </div>
-                  <div className="fleet-progress" role="progressbar" aria-label="Quarterly monthly record approval completeness" aria-valuenow={quarterData.completion} aria-valuemin={0} aria-valuemax={100}><span style={{ width: quarterData.completion + '%' }} /></div>
+                  <div className="fleet-progress" role="progressbar" aria-label="Quarterly monthly record approval completeness" aria-valuenow={quarterData.expected ? quarterData.completion : 0} aria-valuemin={0} aria-valuemax={100}><span style={{ width: (quarterData.expected ? quarterData.completion : 0) + '%' }} /></div>
                   <div className="fleet-quarterly-months">
                     {quarterMonths.map((month) => {
                       const approved = quarterData.vehicles.filter((item) => item.monthlyStatus[month] === 'Approved').length
                       const pending = quarterData.vehicles.filter((item) => item.monthlyStatus[month] === 'Pending').length
                       const returned = quarterData.vehicles.filter((item) => item.monthlyStatus[month] === 'Returned').length
                       const missing = quarterData.vehicles.filter((item) => item.monthlyStatus[month] === 'Missing').length
+                      const notRequired = quarterData.vehicles.filter((item) => item.monthlyStatus[month] === 'Not required').length
+                      const required = quarterData.vehicles.length - notRequired
                       return (
                         <div className={'fleet-quarterly-month ' + (month > currentPeriod() ? 'is-upcoming' : '')} key={month}>
                           <h3>{displayPeriod(month)}</h3>
                           {month > currentPeriod() && <span className="fleet-eyebrow">UPCOMING MONTH</span>}
-                          <div className="fleet-quarterly-month__counts"><strong>{approved}/{quarterData.vehicles.length}</strong><span>Approved</span></div>
-                          <div className="fleet-quarterly-month__detail">{pending > 0 && <Tone tone="pending">{pending} pending</Tone>}{returned > 0 && <Tone tone="returned">{returned} returned</Tone>}{missing > 0 && <Tone tone="muted">{missing} missing</Tone>}{approved === quarterData.vehicles.length && <Tone tone="approved">Complete</Tone>}</div>
+                          <div className="fleet-quarterly-month__counts"><strong>{approved}/{required}</strong><span>Approved / required</span></div>
+                          <div className="fleet-quarterly-month__detail">{pending > 0 && <Tone tone="pending">{pending} pending</Tone>}{returned > 0 && <Tone tone="returned">{returned} returned</Tone>}{missing > 0 && <Tone tone="muted">{missing} missing</Tone>}{notRequired > 0 && <Tone tone="muted">{notRequired} not required</Tone>}{required > 0 && approved === required && <Tone tone="approved">Approved</Tone>}{required === 0 && <Tone tone="muted">No reports required</Tone>}</div>
                         </div>
                       )
                     })}
                   </div>
                   <div className="fleet-quarterly-grid">
-                    <SectionTitle eyebrow="RECONCILIATION MATRIX" title="Vehicle-by-month status" description="Open each missing, returned or pending month to complete the workflow. Approved rows are read-only." action={<button type="button" className="fleet-button fleet-button--primary" disabled={!quarterExport.count} onClick={downloadQuarterCsv}><Download size={16} /> Download quarter review ({quarterExport.count})</button>} />
+                    <SectionTitle eyebrow="RECONCILIATION MATRIX" title="Vehicle-by-month status" description="Open missing, returned or pending records directly. Data-quality findings are separate from approval status and require source-record inspection." action={<button type="button" className="fleet-button fleet-button--primary" disabled={!quarterExport.count} onClick={downloadQuarterCsv}><Download size={16} /> Download quarter review ({quarterExport.count})</button>} />
+                    <div className="fleet-tabs fleet-tabs--compact" role="group" aria-label="Quarterly reconciliation filter">
+                      <button type="button" className={'fleet-tab ' + (quarterQualityFilter === 'All' ? 'is-active' : '')} aria-pressed={quarterQualityFilter === 'All'} onClick={() => setQuarterQualityFilter('All')}>All units ({quarterData.vehicles.length})</button>
+                      <button type="button" className={'fleet-tab ' + (quarterQualityFilter === 'Incomplete' ? 'is-active' : '')} aria-pressed={quarterQualityFilter === 'Incomplete'} onClick={() => setQuarterQualityFilter('Incomplete')}>Unapproved months ({quarterData.vehicles.filter((row) => row.approvedMonths < row.expectedMonths).length})</button>
+                      <button type="button" className={'fleet-tab ' + (quarterQualityFilter === 'Quality' ? 'is-active' : '')} aria-pressed={quarterQualityFilter === 'Quality'} onClick={() => setQuarterQualityFilter('Quality')}>Data checks ({quarterData.vehiclesWithQualityIssues})</button>
+                    </div>
                     <div className="fleet-table-wrap">
                       <table className="fleet-table fleet-quarterly-reconcile">
                         <thead><tr><th scope="col">Licensed vehicle</th>{quarterMonths.map((month) => <th scope="col" key={month}>{displayPeriod(month)}</th>)}<th scope="col">Quarter total</th><th scope="col">Reconciliation</th></tr></thead>
-                        <tbody>{quarterData.vehicles.slice().sort((a, b) => Number(a.ready) - Number(b.ready) || a.vehicle.unit.localeCompare(b.vehicle.unit)).map((row) => (
-                          <tr key={row.vehicle.id} className={row.ready ? 'is-ready' : 'has-gaps'}>
+                        <tbody>{quarterRows.map((row) => (
+                          <Fragment key={row.vehicle.id}>
+                          <tr className={row.ready ? 'is-ready' : 'has-gaps'}>
                             <td><VehicleName vehicle={row.vehicle} /><small className="fleet-table__meta">{row.vehicle.department}</small></td>
                             {quarterMonths.map((month) => {
                               const status = row.monthlyStatus[month]
@@ -1629,6 +2049,7 @@ export default function FleetApp() {
                                 <td key={month}>
                                   {status === 'Approved'
                                     ? <Tone tone="approved"><Check size={12} /> Approved</Tone>
+                                    : status === 'Not required' ? <Tone tone="muted">Not required</Tone>
                                     : <button type="button" className="fleet-quarterly-gap" aria-label={status + ' for ' + row.vehicle.unit + ' in ' + displayPeriod(month) + '. Open workflow'} onClick={() => openQuarterGap(row.vehicle, month)} disabled={month > currentPeriod()}>
                                       <Tone tone={status === 'Missing' ? 'muted' : status.toLowerCase()}>{status}</Tone><ArrowRight size={14} />
                                     </button>}
@@ -1636,12 +2057,44 @@ export default function FleetApp() {
                               )
                             })}
                             <td><strong>{whole(row.miles)} mi</strong><small className="fleet-table__meta">{currency(row.fuelCost)}</small></td>
-                            <td><Tone tone={row.ready ? 'approved' : 'returned'}>{row.ready ? 'All 3 approved' : row.approvedMonths + ' of 3 approved'}</Tone></td>
+                            <td>
+                              <Tone tone={row.ready ? 'approved' : 'returned'}>{row.expectedMonths === 0 ? 'Not required' : row.ready ? 'Reconciled' : row.approvedMonths + ' of ' + row.expectedMonths + ' approved'}</Tone>
+                              {row.qualityIssues.length > 0 && <button type="button" className="fleet-button fleet-button--small fleet-button--quiet fleet-quarterly-gap" aria-expanded={expandedQualityVehicleId === row.vehicle.id} onClick={() => setExpandedQualityVehicleId((id) => id === row.vehicle.id ? null : row.vehicle.id)}>
+                                <AlertCircle size={14} /> {row.qualityIssues.length} data {row.qualityIssues.length === 1 ? 'issue' : 'issues'} <ChevronDown size={14} />
+                              </button>}
+                            </td>
                           </tr>
+                          {expandedQualityVehicleId === row.vehicle.id && row.qualityIssues.length > 0 && (
+                            <tr id={'fleet-quarter-quality-' + row.vehicle.id} tabIndex={-1} className="fleet-quality-row fleet-record-anchor"><td colSpan={6}>
+                              <section className="fleet-quality-issues" aria-label={'Data quality findings for ' + row.vehicle.unit}>
+                                <h4>{row.vehicle.unit} · Record-level data checks</h4>
+                                <p className="fleet-text-muted">Inspect the source history before requesting correction. Reopening an approved report changes it to Returned and retains the prior approved snapshot.</p>
+                                <ol>{row.qualityIssues.map((issue, index) => <li key={index}>
+                                  <span>{issue}</span>
+                                  <button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => openQuarterQualityIssue(row.vehicle, issue)}>Inspect record <ArrowRight size={14} /></button>
+                                  <button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => beginApprovedCorrection(row.vehicle, issue)}><Pencil size={14} /> Request correction</button>
+                                </li>)}</ol>
+                                {correctionRequest?.vehicleId === row.vehicle.id && (
+                                  <form className="fleet-form fleet-quarterly-correction-form" onSubmit={submitApprovedCorrection}>
+                                    <Field htmlFor={'fleet-quarter-correction-' + row.vehicle.id} label="Reason for reopening approved record (required)" hint={'This changes ' + displayPeriod(correctionRequest.period) + ' to Returned in the local demo and keeps the approved version in the history ledger.'}>
+                                      <textarea id={'fleet-quarter-correction-' + row.vehicle.id} className="fleet-textarea" rows={3} minLength={5} maxLength={400} required value={correctionRequest.reason} onChange={(event) => setCorrectionRequest((current) => current ? { ...current, reason: event.target.value } : current)} placeholder="Describe the missing evidence, incorrect source attribution, or other data issue" />
+                                    </Field>
+                                    <div className="fleet-form-actions">
+                                      <button type="submit" className="fleet-button fleet-button--primary" disabled={correctionRequest.reason.trim().length < 5}><Check size={15} /> Reopen report for correction</button>
+                                      <button type="button" className="fleet-button fleet-button--quiet" onClick={() => setCorrectionRequest(null)}>Cancel</button>
+                                    </div>
+                                  </form>
+                                )}
+                                <button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => openVehicle(row.vehicle.id)}>Vehicle directory <ArrowRight size={14} /></button>
+                              </section>
+                            </td></tr>
+                          )}
+                          </Fragment>
                         ))}</tbody>
                       </table>
                     </div>
                     {!quarterData.vehicles.length && <Empty icon={Truck} title="No licensed vehicles in this scope" description="Choose another department or add a licensed vehicle to include it in the quarter reconciliation." />}
+                    {quarterData.vehicles.length > 0 && !quarterRows.length && <Empty icon={CheckCircle2} title={quarterQualityFilter === 'Quality' ? 'No data-quality findings' : 'No unapproved months'} description="The current quarter and department have no records matching this filter." />}
                     <p className="fleet-text-muted">Quarter review CSV includes all licensed vehicles and missing or incomplete months for reconciliation. It is not an official TxFS import or proof of submission.</p>
                   </div>
                 </FleetCard>
@@ -1659,7 +2112,13 @@ export default function FleetApp() {
                       <thead><tr><th scope="col">Unit</th><th scope="col">Department</th><th scope="col">Period</th><th scope="col">Distance</th><th scope="col">Fuel</th><th scope="col">Reviewed by</th></tr></thead>
                       <tbody>{exportRecords.map((report) => {
                         const vehicle = fleet.vehicles.find((item) => item.id === report.vehicleId)
-                        return <tr key={report.id}><td><strong>{vehicle?.unit}</strong></td><td>{vehicle?.department}</td><td>{displayPeriod(report.period)}</td><td>{whole(report.endOdometer - report.startOdometer)} mi</td><td>{currency(report.fuelCost)}</td><td>{report.reviewedBy ?? '—'}</td></tr>
+                        const recordedUnit = report.unitAtSubmission ?? vehicle?.unit
+                        const recordedDepartment = report.departmentAtSubmission ?? vehicle?.department
+                        return <tr key={report.id}>
+                          <td><strong>{recordedUnit ?? '—'}</strong>{vehicle && recordedUnit !== vehicle.unit && <small className="fleet-table__meta">Current: {vehicle.unit}</small>}{report.attributionSource === 'Legacy inferred' && <small className="fleet-table__meta">Legacy attribution inferred</small>}</td>
+                          <td>{recordedDepartment ?? '—'}{vehicle && recordedDepartment !== vehicle.department && <small className="fleet-table__meta">Current: {vehicle.department}</small>}</td>
+                          <td>{displayPeriod(report.period)}</td><td>{whole(report.endOdometer - report.startOdometer)} mi</td><td>{currency(report.fuelCost)}</td><td>{report.reviewedBy ?? '—'}</td>
+                        </tr>
                       })}</tbody>
                     </table>
                   </div>

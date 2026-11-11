@@ -2630,3 +2630,409 @@ body:has(.fleet-app) {
   .fleet-app[data-role='Driver'] .fleet-field label { margin-bottom: 0; }
   .fleet-app[data-role='Driver'] .fleet-reports-layout :is(.fleet-select,.fleet-input) { min-height: 44px; }
 }
+
+/*
+ * Operations pass 3: immutable report / service history.
+ * Each snapshot is a plain readable record, not a decorative timeline.
+ */
+.fleet-app .fleet-record-anchor.is-highlighted {
+  background: #edf3f6;
+  box-shadow: inset 3px 0 0 #2d7799;
+}
+.fleet-app .fleet-history-card .fleet-record-anchor > td:last-child .fleet-form-actions {
+  justify-content: flex-start;
+  flex-wrap: nowrap;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.fleet-app .fleet-history-expanded > td {
+  padding: 13px !important;
+  background: #f3f6f7;
+  border-bottom-color: #cddce2;
+}
+.fleet-app .fleet-history-ledger {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 15px;
+  border: 1px solid #d8e2e6;
+  border-radius: 5px;
+  background: #fff;
+  color: #344b56;
+}
+.fleet-app .fleet-history-ledger > :is(h3,h4) {
+  margin: 0;
+  color: #283d48;
+  font: 750 14px/1.35 'DM Sans',sans-serif;
+}
+.fleet-app .fleet-history-ledger > p {
+  margin: 0;
+  color: #667a83;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.fleet-app .fleet-history-ledger__entries {
+  display: grid;
+  gap: 0;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid #e0e6e8;
+  border-radius: 5px;
+  overflow: hidden;
+}
+.fleet-app .fleet-history-entry {
+  display: grid;
+  gap: 7px;
+  padding: 12px 14px;
+  background: #fff;
+  border-bottom: 1px solid #e2e8e9;
+  overflow-wrap: anywhere;
+}
+.fleet-app .fleet-history-entry:last-child { border-bottom: 0; }
+.fleet-app .fleet-history-entry:nth-child(even) { background: #fafbfc; }
+.fleet-app .fleet-history-entry__heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 5px 16px;
+}
+.fleet-app .fleet-history-entry__heading strong {
+  color: #2a4350;
+  font-size: 12px;
+  font-weight: 750;
+}
+.fleet-app .fleet-history-entry__heading time {
+  color: #788891;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.fleet-app .fleet-history-entry__meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 14px;
+  color: #596f79;
+  font-size: 11px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+.fleet-app .fleet-history-entry > p {
+  margin: 0;
+  padding-top: 4px;
+  color: #4c6069;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.fleet-app .fleet-history-entry > p strong { color: #304a57; }
+.fleet-app .fleet-work-order-history { margin-top: 15px; }
+@media (max-width: 620px) {
+  .fleet-app .fleet-history-card .fleet-record-anchor > td:last-child .fleet-form-actions .fleet-button {
+    min-height: 44px;
+  }
+  .fleet-app .fleet-history-expanded > td { padding: 9px !important; }
+  .fleet-app .fleet-history-ledger { padding: 11px; }
+  .fleet-app .fleet-history-entry { gap: 6px; padding: 11px; }
+  .fleet-app .fleet-history-entry__meta { gap: 5px 10px; }
+  .fleet-app .fleet-history-entry__heading { gap: 4px; }
+}
+
+/* Local follow-up tasks are an operational work list, NOT sent reminders. */
+.fleet-app .fleet-follow-up-queue {
+  min-width: 0;
+  margin-bottom: 17px;
+}
+.fleet-app .fleet-follow-up-table { min-width: 820px; }
+.fleet-app .fleet-follow-up-table td:nth-child(4) {
+  min-width: 210px;
+  max-width: 330px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.fleet-app .fleet-follow-up-table td:nth-child(6) { min-width: 185px; }
+.fleet-app .fleet-follow-up-row.is-overdue {
+  background: #fcf8f5;
+  box-shadow: inset 3px 0 0 #b2755c;
+}
+.fleet-app .fleet-follow-up-row.is-overdue:hover { background: #faf2ed; }
+.fleet-app .fleet-follow-up-table .fleet-exception__actions {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+}
+.fleet-app .fleet-follow-up-table .fleet-exception__actions .fleet-button {
+  min-height: 33px;
+  padding: 5px 9px;
+  border: 1px solid #d9e2e6;
+  white-space: nowrap;
+}
+.fleet-app .fleet-follow-up-detail,
+.fleet-app .fleet-follow-up-detail:hover { background: #f3f6f7; }
+.fleet-app .fleet-follow-up-detail > td { padding: 12px 15px !important; }
+.fleet-app .fleet-follow-up-detail .fleet-follow-up-form {
+  max-width: 750px;
+  margin: 0;
+  background: #fff;
+}
+.fleet-app .fleet-follow-up-detail .fleet-follow-up-form .fleet-form-grid {
+  grid-template-columns: repeat(3,minmax(0,1fr));
+}
+.fleet-app .fleet-follow-up-form .fleet-profile-form__heading h3 { font-size: 13px; }
+.fleet-app .fleet-follow-up-form .fleet-form-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.fleet-app .fleet-follow-up-form .fleet-field__hint,
+.fleet-app .fleet-follow-up-form .fleet-text-muted { color: #637881; font-size: 11px; }
+.fleet-app .fleet-follow-up-form :is(.fleet-select,.fleet-input,.fleet-textarea):focus-visible {
+  outline: 3px solid rgba(35,107,148,.28);
+  outline-offset: 2px;
+}
+.fleet-app .fleet-follow-up-form .fleet-button:disabled { opacity: .62; }
+.fleet-app .fleet-exception-follow-up-row .fleet-follow-up-form .fleet-form-grid {
+  grid-template-columns: repeat(2,minmax(0,1fr));
+}
+.fleet-app .fleet-exception-follow-up-row .fleet-follow-up-form .fleet-field--full,
+.fleet-app .fleet-follow-up-detail .fleet-follow-up-form .fleet-field--full {
+  grid-column: 1 / -1;
+}
+@media (max-width: 900px) {
+  .fleet-app .fleet-follow-up-detail .fleet-follow-up-form .fleet-form-grid {
+    grid-template-columns: repeat(2,minmax(0,1fr));
+  }
+}
+@media (max-width: 620px) {
+  .fleet-app .fleet-follow-up-queue .fleet-section-title { margin-bottom: 10px; }
+  .fleet-app .fleet-follow-up-table .fleet-exception__actions .fleet-button { min-height: 44px; }
+  .fleet-app .fleet-follow-up-detail > td { padding: 9px !important; }
+  .fleet-app .fleet-follow-up-detail .fleet-follow-up-form { padding: 11px; }
+  .fleet-app .fleet-exception-follow-up-row .fleet-follow-up-form .fleet-form-grid,
+  .fleet-app .fleet-follow-up-detail .fleet-follow-up-form .fleet-form-grid {
+    grid-template-columns: minmax(0,1fr);
+  }
+  .fleet-app .fleet-follow-up-form .fleet-form-actions {
+    position: static;
+    margin: 0;
+    padding: 12px 0 0;
+    box-shadow: none;
+  }
+  .fleet-app .fleet-follow-up-form .fleet-form-actions .fleet-button { min-height: 44px; }
+  .fleet-app .fleet-follow-up-form .fleet-form-actions .fleet-button--primary { flex: 1 1 auto; }
+}
+
+/* Quarterly data-quality reconciliation: flags do not override approval. */
+.fleet-app .fleet-quarterly-panel .fleet-quarterly-stats {
+  grid-template-columns: repeat(5,minmax(0,1fr));
+}
+.fleet-app .fleet-quarterly-quality {
+  border-color: #dfd9d0 !important;
+  background: #faf9f7 !important;
+}
+.fleet-app .fleet-quarterly-quality strong { color: #725a3f; }
+.fleet-app .fleet-quarterly-grid > .fleet-tabs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  width: max-content;
+  max-width: 100%;
+  min-height: 39px;
+  margin: 1px 0 3px;
+  padding: 3px;
+  border: 1px solid #dce3e6;
+  border-radius: 5px;
+  background: #f3f5f6;
+}
+.fleet-app .fleet-quarterly-grid > .fleet-tabs .fleet-tab {
+  min-height: 33px;
+  padding: 6px 12px;
+  color: #476475;
+  font-size: 12px;
+}
+.fleet-app .fleet-quarterly-grid > .fleet-tabs .fleet-tab.is-active {
+  border-color: #cbd9df;
+  background: #fff;
+  box-shadow: none;
+  color: #234a5e;
+}
+.fleet-app .fleet-quarterly-reconcile td:last-child .fleet-quarterly-gap {
+  margin-top: 6px;
+  padding: 5px 7px;
+  border: 1px solid #d8e2e6;
+  background: #fff;
+  color: #385d70;
+  white-space: nowrap;
+}
+.fleet-app .fleet-quarterly-reconcile td:last-child .fleet-quarterly-gap:hover,
+.fleet-app .fleet-quarterly-reconcile td:last-child .fleet-quarterly-gap:focus-visible {
+  background: #edf3f5;
+  border-color: #a7c0cb;
+}
+.fleet-app .fleet-quality-row,
+.fleet-app .fleet-quality-row:hover { background: #f3f6f7; }
+.fleet-app .fleet-quality-row > td { padding: 11px 13px !important; }
+.fleet-app .fleet-quality-issues {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 15px;
+  border: 1px solid #dce3e6;
+  border-radius: 5px;
+  background: #fff;
+  color: #3d535d;
+}
+.fleet-app .fleet-quality-issues h4 {
+  margin: 0;
+  color: #2d4552;
+  font: 750 14px/1.35 'DM Sans',sans-serif;
+}
+.fleet-app .fleet-quality-issues p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.fleet-app .fleet-quality-issues ol {
+  display: grid;
+  gap: 0;
+  min-width: 0;
+  margin: 2px 0 0;
+  padding: 0;
+  border: 1px solid #e1e6e9;
+  border-radius: 4px;
+  list-style: none;
+}
+.fleet-app .fleet-quality-issues li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid #e1e6e9;
+  color: #4d606a;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.fleet-app .fleet-quality-issues li:last-child { border-bottom: 0; }
+.fleet-app .fleet-quality-issues li > span { min-width: 0; overflow-wrap: anywhere; }
+.fleet-app .fleet-quality-issues li .fleet-button { flex: 0 0 auto; }
+.fleet-app .fleet-quality-issues > .fleet-button { width: max-content; max-width: 100%; }
+.fleet-app .fleet-quarterly-correction-form {
+  display: grid;
+  gap: 11px;
+  margin: 3px 0;
+  padding: 14px;
+  border: 1px solid #d9e2e5;
+  border-left: 3px solid #678d9e;
+  border-radius: 4px;
+  background: #f8fafb;
+}
+.fleet-app .fleet-quarterly-correction-form .fleet-field { min-width: 0; }
+.fleet-app .fleet-quarterly-correction-form .fleet-field label {
+  color: #2d4653;
+  font-size: 12px;
+}
+.fleet-app .fleet-quarterly-correction-form .fleet-field__hint {
+  display: block;
+  margin-top: 4px;
+  color: #627883;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.fleet-app .fleet-quarterly-correction-form .fleet-form-actions {
+  justify-content: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding-top: 10px;
+}
+@media (max-width: 1100px) {
+  .fleet-app .fleet-quarterly-panel .fleet-quarterly-stats {
+    grid-template-columns: repeat(3,minmax(0,1fr));
+  }
+}
+@media (max-width: 620px) {
+  .fleet-app .fleet-quarterly-panel .fleet-quarterly-stats {
+    grid-template-columns: repeat(2,minmax(0,1fr));
+  }
+  .fleet-app .fleet-quarterly-grid > .fleet-tabs {
+    width: 100%;
+    align-items: stretch;
+  }
+  .fleet-app .fleet-quarterly-grid > .fleet-tabs .fleet-tab {
+    flex: 1 1 100px;
+    min-height: 44px;
+    padding: 6px;
+    font-size: 11px;
+  }
+  .fleet-app .fleet-quality-row > td { padding: 8px !important; }
+  .fleet-app .fleet-quality-issues { padding: 10px; }
+  .fleet-app .fleet-quality-issues li { align-items: stretch; flex-direction: column; gap: 8px; }
+  .fleet-app .fleet-quality-issues li .fleet-button { min-height: 44px; }
+  .fleet-app .fleet-quality-issues > .fleet-button { min-height: 44px; }
+  .fleet-app .fleet-quarterly-correction-form { padding: 11px; }
+  .fleet-app .fleet-quarterly-correction-form .fleet-form-actions {
+    position: static; margin: 0; padding: 10px 0 0; box-shadow: none;
+  }
+  .fleet-app .fleet-quarterly-correction-form .fleet-form-actions .fleet-button {
+    flex: 1 1 160px;
+    min-height: 44px;
+  }
+}
+
+/* Search/filter controls need explicit hit targets and visible focus. */
+.fleet-app .fleet-search,
+.fleet-app .fleet-audit-search { max-width: 100%; min-width: 0; }
+.fleet-app .fleet-search > input {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  padding-right: 47px;
+}
+.fleet-app .fleet-search > svg { color: #748894; }
+.fleet-app .fleet-search > button {
+  right: 4px;
+  min-width: 36px;
+  width: 36px;
+  min-height: 36px;
+  height: 36px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: #eef2f4;
+  color: #365c70;
+}
+.fleet-app .fleet-search > button:hover { border-color: #cddbe1; background: #e5edf0; }
+.fleet-app .fleet-search > button:focus-visible,
+.fleet-app .fleet-exception-toolbar .fleet-button:focus-visible,
+.fleet-app .fleet-follow-up-table .fleet-button:focus-visible {
+  outline: 3px solid rgba(38,104,141,.35);
+  outline-offset: 2px;
+}
+.fleet-app .fleet-audit-search { margin-bottom: 12px; }
+@media (max-width: 620px) {
+  .fleet-app .fleet-search > input { min-height: 44px; padding-right: 54px; }
+  .fleet-app .fleet-search > button { right: 1px; min-width: 44px; width: 44px; min-height: 44px; height: 44px; }
+  .fleet-app .fleet-exception-toolbar .fleet-button { min-height: 44px; }
+}
+
+/* Third-pass status strip adds task ownership without losing dense alignment. */
+.fleet-app .fleet-ops-summary { grid-template-columns: repeat(6,minmax(0,1fr)); }
+@media (max-width: 1020px) {
+  .fleet-app .fleet-ops-summary { grid-template-columns: repeat(3,minmax(0,1fr)); }
+  .fleet-app .fleet-ops-summary__item:nth-child(3n) { border-right: 0; }
+  .fleet-app .fleet-ops-summary__item:nth-last-child(-n+3) { border-bottom: 0; }
+}
+@media (max-width: 620px) {
+  .fleet-app .fleet-ops-summary { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .fleet-app .fleet-ops-summary__item:nth-child(3) { border-right: 1px solid var(--fs-border); }
+  .fleet-app .fleet-ops-summary__item:nth-child(even) { border-right: 0; }
+  .fleet-app .fleet-ops-summary__item:nth-last-child(-n+3) { border-bottom: 1px solid var(--fs-border); }
+  .fleet-app .fleet-ops-summary__item:nth-last-child(-n+2) { border-bottom: 0; }
+}
