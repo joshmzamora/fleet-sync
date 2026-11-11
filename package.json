@@ -4,11 +4,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0",
+    "dev": "vite --host 127.0.0.1",
+    "shared:serve": "node --disable-warning=ExperimentalWarning --experimental-strip-types server/run.mjs",
+    "shared:init": "node --disable-warning=ExperimentalWarning --experimental-strip-types server/init.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "test": "node --disable-warning=ExperimentalWarning --experimental-strip-types --test tests/*.test.mjs",
+    "test:shared": "node --disable-warning=ExperimentalWarning --experimental-strip-types --test tests/shared-http.test.mjs",
+    "test:browser:shared": "node --disable-warning=ExperimentalWarning --experimental-strip-types scripts/fleet-shared-smoke.mjs",
+    "test:browser:built": "node --disable-warning=ExperimentalWarning --experimental-strip-types scripts/shared-built-smoke.mjs",
     "test:browser": "node scripts/browser-smoke.mjs",
     "test:browser:fleet": "node scripts/fleet-browser-smoke.mjs"
   },

@@ -109,6 +109,8 @@ import type {
   VehicleKind,
   VehicleStatus,
 } from './domain'
+import { sharedClient, SharedApiError } from './shared-client'
+import type { SharedCommand, SharedImportPreview, SharedUser } from './shared-client'
 import './styles.css'
 
 type View = 'overview' | 'reports' | 'vehicles' | 'maintenance' | 'exports'
@@ -531,6 +533,23 @@ function TicketHistoryLedger({ entries }: { entries: TicketHistoryEntry[] }) {
 export default function FleetApp() {
   const [fleet, setFleet] = useState<FleetState>(() => loadFleetState())
   const fleetRef = useRef(fleet)
+  const demoSnapshotRef = useRef(fleet)
+  const demoRoleRef = useRef<Role>('Fleet Admin')
+  const importCandidateRef = useRef<FleetState | null>(null)
+  const sharedRevisionRef = useRef<number | null>(null)
+  const preserveDraftOnRefreshRef = useRef(false)
+  const busyRef = useRef(false)
+  const [connectionMode, setConnectionMode] = useState<'demo' | 'shared'>('demo')
+  const sharedMode = connectionMode === 'shared'
+  const [sharedStatus, setSharedStatus] = useState<'checking' | 'login' | 'ready' | 'error'>('login')
+  const [sharedUser, setSharedUser] = useState<SharedUser | null>(null)
+  const [sharedBusy, setSharedBusy] = useState(false)
+  const [sharedError, setSharedError] = useState('')
+  const [sharedUsername, setSharedUsername] = useState('')
+  const [sharedPassword, setSharedPassword] = useState('')
+  const [importPreview, setImportPreview] = useState<SharedImportPreview | null>(null)
+  const [importConfirmed, setImportConfirmed] = useState(false)
+  const [importPanelOpen, setImportPanelOpen] = useState(false)
   const [initialFilters] = useState(restoreFilters)
   const [role, setRole] = useState<Role>('Fleet Admin')
   const [view, setView] = useState<View>('overview')
@@ -555,6 +574,9 @@ export default function FleetApp() {
   const [vehicleFormOpen, setVehicleFormOpen] = useState(false)
   const [vehicleDraft, setVehicleDraft] = useState<VehicleDraft>(blankVehicleDraft)
   const [ticketFilter, setTicketFilter] = useState<TicketFilter>(initialFilters.ticketFilter)
+  const [workSearch, setWorkSearch] = useState('')
+  const [workPriority, setWorkPriority] = useState<'All' | Severity>('All')
+  const [workAssignment, setWorkAssignment] = useState<'All' | 'Mine' | 'Unassigned'>('All')
   const [ticketFormOpen, setTicketFormOpen] = useState(false)
   const [selectedTicketId, setSelectedTicketId] = useState<string | null>(null)
   const [expandedTicketHistoryId, setExpandedTicketHistoryId] = useState<string | null>(null)
@@ -586,6 +608,21 @@ export default function FleetApp() {
   const [expandedQualityVehicleId, setExpandedQualityVehicleId] = useState<string | null>(null)
   const [correctionRequest, setCorrectionRequest] = useState<{ reportId: string; vehicleId: string; period: string; reason: string } | null>(null)
   const [focusTarget, setFocusTarget] = useState<string | null>(null)
+  // Demo role switching changes the workspace presentation, never permissions.
+  // Shared role and all actual action permissions are enforced by the server.
+  const canSubmit = role === 'Driver' || (!sharedMode && role === 'Fleet Admin')
+  const canReview = role === 'Supervisor' || role === 'Fleet Admin'
+  const canManageFleet = role === 'Fleet Admin'
+  const canManageService = role === 'Maintenance' || role === 'Fleet Admin'
+  const canManageFollowUps = role === 'Supervisor' || role === 'Fleet Admin'
+  const navItems = NAV.filter((item) => {
+    if (role === 'Driver') return item.id === 'reports'
+    if (item.id === 'exports') return canManageFleet
+    if (item.id === 'reports') return canSubmit || canReview
+    if (item.id === 'maintenance') return canManageService
+    if (item.id === 'overview') return role === 'Fleet Admin' || role === 'Supervisor'
+    return true
+  })
 
   const toast = useCallback((message: string, kind: Toast['kind'] = 'success') => {
     const id = ++nextToastId.current
@@ -638,14 +675,276 @@ export default function FleetApp() {
     return () => window.cancelAnimationFrame(frame)
   }, [focusTarget, view, reportsTab, ticketFilter, department, period])
 
-  const commit = (change: (current: FleetState) => FleetState, message: string): boolean => {
+  const setCurrentFleet = (next: FleetState) => {
+    fleetRef.current = next
+    setFleet(next)
+  }
+
+  const applySharedState = (result: { revision: number; state: FleetState }, preserveDraft = false) => {
+    if (!Number.isInteger(result.revision) || !result.state || !Array.isArray(result.state.vehicles)) {
+      throw new SharedApiError('The shared server returned an invalid fleet snapshot.', 0)
+    }
+    sharedRevisionRef.current = result.revision
+    if (preserveDraft) preserveDraftOnRefreshRef.current = true
+    setCurrentFleet(result.state)
+  }
+
+  const activateSharedUser = async (user: SharedUser) => {
+    const snapshot = await sharedClient.state()
+    setSharedUser(user)
+    setRole(user.role)
+    setReviewer(user.displayName)
+    setFollowUpActor(user.displayName)
+    setTaskActor(user.displayName)
+    setSharedError('')
+    setSharedStatus('ready')
+    setImportPreview(null)
+    setImportConfirmed(false)
+    applySharedState(snapshot)
+    setDepartment(user.department && user.role !== 'Fleet Admin' ? user.department : 'All departments')
+    const preferred = preferredReportVehicle(snapshot.state, period, user.department ?? 'All departments')
+    setReportVehicleId(preferred?.id ?? '')
+    setReportDraft({
+      ...reportDraftFor(snapshot.state, preferred, period),
+      ...(user.role === 'Driver' ? { operator: user.displayName } : {}),
+    })
+    setSelectedVehicleId(snapshot.state.vehicles[0]?.id ?? null)
+    setTicketDraft(blankTicketDraft(snapshot.state.vehicles[0]?.id))
+    setReportsTab(user.role === 'Supervisor' || user.role === 'Fleet Admin' ? 'review' : 'submit')
+    setWorkAssignment('All')
+    setWorkPriority('All')
+    setWorkSearch('')
+    setView(user.role === 'Driver' || user.role === 'Supervisor' ? 'reports' : user.role === 'Maintenance' ? 'maintenance' : 'overview')
+    setMobileNavOpen(false)
+  }
+
+  const openSharedRecords = async () => {
+    if (busyRef.current) return
+    setMobileNavOpen(false)
+    if (!sharedMode) {
+      demoSnapshotRef.current = fleetRef.current
+      demoRoleRef.current = role
+    }
+    setConnectionMode('shared')
+    setSharedStatus('checking')
+    setSharedError('')
+    busyRef.current = true
+    setSharedBusy(true)
+    try {
+      const health = await sharedClient.health()
+      if (health.shared !== true) throw new SharedApiError('Shared records are not enabled on this server.', 0)
+      const session = await sharedClient.session()
+      if (session.user) await activateSharedUser(session.user)
+      else {
+        setSharedStatus('login')
+        setSharedUser(null)
+      }
+    } catch (error) {
+      setSharedStatus('error')
+      setSharedError(error instanceof Error ? error.message : 'Shared records could not be opened.')
+    } finally {
+      busyRef.current = false
+      setSharedBusy(false)
+    }
+  }
+
+  const loginToShared = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (busyRef.current) return
+    busyRef.current = true
+    setSharedBusy(true)
+    setSharedError('')
+    try {
+      const session = await sharedClient.login(sharedUsername.trim(), sharedPassword)
+      setSharedPassword('')
+      await activateSharedUser(session.user)
+    } catch (error) {
+      setSharedPassword('')
+      setSharedStatus('login')
+      setSharedError(error instanceof Error ? error.message : 'Could not sign in.')
+    } finally {
+      busyRef.current = false
+      setSharedBusy(false)
+    }
+  }
+
+  const leaveSharedRecords = () => {
+    if (busyRef.current) return
+    setConnectionMode('demo')
+    setSharedUser(null)
+    sharedRevisionRef.current = null
+    setSharedStatus('login')
+    setSharedError('')
+    setSharedPassword('')
+    setImportPreview(null)
+    setImportConfirmed(false)
+    setImportPanelOpen(false)
+    importCandidateRef.current = null
+    setCurrentFleet(demoSnapshotRef.current)
+    setRole(demoRoleRef.current)
+    setReviewer('Demo Supervisor')
+    setFollowUpActor('Demo Fleet Coordinator')
+    setTaskActor('Demo Fleet Coordinator')
+    setDepartment('All departments')
+    const preferred = preferredReportVehicle(demoSnapshotRef.current, period)
+    setReportVehicleId(preferred?.id ?? '')
+    setReportDraft(reportDraftFor(demoSnapshotRef.current, preferred, period))
+    setSelectedVehicleId(demoSnapshotRef.current.vehicles[0]?.id ?? null)
+    setTicketDraft(blankTicketDraft(demoSnapshotRef.current.vehicles[0]?.id))
+    setView('overview')
+    setMobileNavOpen(false)
+    toast('Browser Demo restored. Shared sign-in remains active until you choose Log out; no records were copied.', 'info')
+  }
+
+  const logoutFromShared = async () => {
+    if (busyRef.current) return
+    busyRef.current = true
+    setSharedBusy(true)
+    setSharedError('')
+    try {
+      await sharedClient.logout()
+      setSharedUser(null)
+      setSharedStatus('login')
+      sharedRevisionRef.current = null
+      setSharedPassword('')
+      setImportPreview(null)
+      setImportConfirmed(false)
+      setImportPanelOpen(false)
+      importCandidateRef.current = null
+      toast('Signed out of shared records. Local Demo data is unchanged.', 'info')
+    } catch (error) {
+      setSharedError(error instanceof Error ? error.message : 'Could not log out. Please retry.')
+    } finally {
+      busyRef.current = false
+      setSharedBusy(false)
+    }
+  }
+
+  const refreshSharedRecords = async () => {
+    if (busyRef.current || !sharedMode || sharedStatus !== 'ready') return
+    busyRef.current = true
+    setSharedBusy(true)
+    setSharedError('')
+    try {
+      applySharedState(await sharedClient.state(), true)
+      toast('Shared records refreshed. Unsaved form inputs were preserved where possible.', 'info')
+    } catch (error) {
+      if (error instanceof SharedApiError && error.status === 401) {
+        setSharedUser(null)
+        setSharedStatus('login')
+        sharedRevisionRef.current = null
+      }
+      setSharedError(error instanceof Error ? error.message : 'Shared records could not be refreshed. You can return to Demo.')
+    } finally {
+      busyRef.current = false
+      setSharedBusy(false)
+    }
+  }
+
+  const previewDemoImport = async () => {
+    if (busyRef.current || !sharedUser || sharedUser.role !== 'Fleet Admin') return
+    busyRef.current = true
+    setSharedBusy(true)
+    setSharedError('')
+    setImportPreview(null)
+    setImportConfirmed(false)
+    try {
+      const candidate = demoSnapshotRef.current
+      const result = await sharedClient.importPreview(candidate)
+      importCandidateRef.current = candidate
+      setImportPreview(result)
+    } catch (error) {
+      importCandidateRef.current = null
+      setSharedError(error instanceof Error ? error.message : 'Cannot preview browser data import.')
+    } finally {
+      busyRef.current = false
+      setSharedBusy(false)
+    }
+  }
+
+  const importDemoData = async () => {
+    if (busyRef.current || !sharedUser || sharedUser.role !== 'Fleet Admin' || !importPreview?.allowed ||
+      !importPreview.fingerprint || !importConfirmed || !importCandidateRef.current || sharedRevisionRef.current === null) return
+    busyRef.current = true
+    setSharedBusy(true)
+    setSharedError('')
+    try {
+      const result = await sharedClient.importState(sharedRevisionRef.current, importCandidateRef.current, importPreview.fingerprint)
+      applySharedState(result)
+      setImportPreview(null)
+      importCandidateRef.current = null
+      setImportConfirmed(false)
+      setImportPanelOpen(false)
+      toast('Browser demo records imported into the previously empty shared database. This does not submit anything to TxFS.')
+    } catch (error) {
+      if (error instanceof SharedApiError && error.status === 409) {
+        try {
+          applySharedState(await sharedClient.state(), true)
+          toast('Shared records changed while importing. Refreshed; preview again before retrying.', 'error')
+        } catch {
+          toast('The shared import conflicted and the latest shared records could not be loaded.', 'error')
+        }
+      } else setSharedError(error instanceof Error ? error.message : 'Shared import failed.')
+      setImportPreview(null)
+      importCandidateRef.current = null
+      setImportConfirmed(false)
+    } finally {
+      busyRef.current = false
+      setSharedBusy(false)
+    }
+  }
+
+  /** Demo applies a local domain transition; Shared sends only one server-authorized command. */
+  const commit = async (
+    change: (current: FleetState) => FleetState,
+    message: string,
+    command?: SharedCommand,
+  ): Promise<boolean> => {
+    if (busyRef.current) return false
+    if (sharedMode) {
+      if (sharedStatus !== 'ready' || !sharedUser || sharedRevisionRef.current === null || !command) {
+        toast('Sign in to shared records before making a change.', 'error')
+        return false
+      }
+      busyRef.current = true
+      setSharedBusy(true)
+      try {
+        const result = await sharedClient.action(sharedRevisionRef.current, command)
+        applySharedState(result)
+        setSharedError('')
+        toast(message.replace(/in (this |your )?local demo(?: fleet)?/ig, 'in shared records')
+          .replace(/demo supervisor queue/ig, 'shared supervisor queue').replace(/saved locally/ig, 'saved to shared records'))
+        return true
+      } catch (error) {
+        if (error instanceof SharedApiError && error.status === 409) {
+          try {
+            applySharedState(await sharedClient.state(), true)
+            toast('Changes from another session; refreshed, retry. Your draft has been preserved where possible.', 'error')
+          } catch (refreshError) {
+            toast('Changes from another session. Refresh failed: ' + (refreshError instanceof Error ? refreshError.message : 'Server unavailable'), 'error')
+          }
+        } else {
+          if (error instanceof SharedApiError && error.status === 401) {
+            setSharedUser(null)
+            setSharedStatus('login')
+            sharedRevisionRef.current = null
+          }
+          if (error instanceof SharedApiError && error.status === 0) setSharedError(error.message)
+          toast(error instanceof Error ? error.message : 'Could not save the shared change.', 'error')
+        }
+        return false
+      } finally {
+        busyRef.current = false
+        setSharedBusy(false)
+      }
+    }
     try {
       const next = change(fleetRef.current)
       // Write before updating the view so a quota/private-mode failure cannot
       // make a user believe a record persisted when it did not.
       saveFleetState(next)
-      fleetRef.current = next
-      setFleet(next)
+      demoSnapshotRef.current = next
+      setCurrentFleet(next)
       toast(message)
       return true
     } catch (error) {
@@ -655,8 +954,10 @@ export default function FleetApp() {
   }
 
   const departments = useMemo(
-    () => Array.from(new Set([...DEPARTMENTS, ...fleet.vehicles.map((vehicle) => vehicle.department)])).sort(),
-    [fleet.vehicles],
+    () => sharedMode && sharedUser?.department && sharedUser.role !== 'Fleet Admin'
+      ? [sharedUser.department]
+      : Array.from(new Set([...DEPARTMENTS, ...fleet.vehicles.map((vehicle) => vehicle.department)])).sort(),
+    [fleet.vehicles, sharedMode, sharedUser],
   )
   const filteredVehicles = useMemo(
     () => fleet.vehicles.filter((vehicle) => department === 'All departments' || vehicle.department === department),
@@ -671,6 +972,19 @@ export default function FleetApp() {
     () => fleet.tickets.filter((ticket) => filteredIds.has(ticket.vehicleId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
     [fleet.tickets, filteredIds],
   )
+  const visibleMaintenanceTickets = useMemo(() => filteredTickets.filter((ticket) => {
+    if (ticketFilter === 'Active' ? ticket.status === 'Resolved' : ticketFilter !== 'All' && ticket.status !== ticketFilter) return false
+    if (workPriority !== 'All' && ticket.severity !== workPriority) return false
+    if (workAssignment === 'Unassigned' && ticket.assignee) return false
+    if (workAssignment === 'Mine') {
+      const assignee = ticket.assignee?.trim().toLowerCase()
+      if (!assignee || !sharedUser || (assignee !== sharedUser.displayName.toLowerCase() && assignee !== sharedUser.username.toLowerCase())) return false
+    }
+    const vehicle = fleet.vehicles.find((unit) => unit.id === ticket.vehicleId)
+    const q = workSearch.trim().toLowerCase()
+    return !q || [ticket.title, ticket.description, ticket.assignee, vehicle?.unit, vehicle?.department, ticket.status]
+      .some((value) => value?.toLowerCase().includes(q))
+  }), [filteredTickets, ticketFilter, workPriority, workAssignment, workSearch, sharedUser, fleet.vehicles])
   const overviewTickets = useMemo(() => {
     const severityRank: Record<Severity, number> = { High: 0, Medium: 1, Low: 2 }
     return filteredTickets
@@ -740,12 +1054,19 @@ export default function FleetApp() {
     .sort((a, b) => Number(a.ready) - Number(b.ready) || b.qualityIssues.length - a.qualityIssues.length || a.vehicle.unit.localeCompare(b.vehicle.unit)), [quarterData.vehicles, quarterQualityFilter])
 
   useEffect(() => {
+    if (preserveDraftOnRefreshRef.current) {
+      preserveDraftOnRefreshRef.current = false
+      if (filteredVehicles.some((vehicle) => vehicle.id === reportVehicleId && requiresMonthlyReport(vehicle, period))) return
+    }
     const vehicle = filteredVehicles.find((item) => item.id === reportVehicleId && requiresMonthlyReport(item, period)) ??
       filteredVehicles.find((item) => requiresMonthlyReport(item, period))
     setReportVehicleId(vehicle?.id ?? '')
-    setReportDraft(reportDraftFor(fleet, vehicle, period))
+    setReportDraft({
+      ...reportDraftFor(fleet, vehicle, period),
+      ...(sharedMode && sharedUser?.role === 'Driver' ? { operator: sharedUser.displayName } : {}),
+    })
     // The form should refresh on filter/period changes, not on unrelated audit events.
-  }, [department, period, reportVehicleId, fleet.vehicles])
+  }, [department, period, reportVehicleId, fleet.vehicles, sharedMode, sharedUser])
 
   useEffect(() => {
     if (selectedVehicleId && filteredIds.has(selectedVehicleId)) return
@@ -773,6 +1094,7 @@ export default function FleetApp() {
   }
 
   const changeRole = (next: Role) => {
+    if (sharedMode) return
     setRole(next)
     if (next === 'Driver') {
       const vehicle = preferredReportVehicle(fleetRef.current, period, department)
@@ -784,6 +1106,7 @@ export default function FleetApp() {
       setReportsTab('review')
       changePage('reports')
     } else if (next === 'Maintenance') {
+      setWorkAssignment('All')
       changePage('maintenance')
     } else {
       changePage('overview')
@@ -800,16 +1123,32 @@ export default function FleetApp() {
   const openReport = (vehicleId: string, targetPeriod = period) => {
     const vehicle = fleetRef.current.vehicles.find((candidate) => candidate.id === vehicleId)
     if (!vehicle) return
+    if (!canSubmit) {
+      const existing = activeReportFor(fleetRef.current, vehicleId, targetPeriod)
+      if (existing) openReportHistory(existing.id)
+      else {
+        openVehicle(vehicleId)
+        toast('This record needs a Driver submission. Supervisors can create a follow-up task.', 'info')
+      }
+      return
+    }
     if (department !== 'All departments' && department !== vehicle.department) setDepartment('All departments')
     if (targetPeriod !== period) setPeriod(targetPeriod)
     setReportVehicleId(vehicleId)
-    setReportDraft(reportDraftFor(fleetRef.current, vehicle, targetPeriod))
+    setReportDraft({
+      ...reportDraftFor(fleetRef.current, vehicle, targetPeriod),
+      ...(sharedMode && sharedUser?.role === 'Driver' ? { operator: sharedUser.displayName } : {}),
+    })
     setReportsTab('submit')
     changePage('reports')
     setFocusTarget('fleet-report-form')
   }
 
   const openReview = (reportId: string, targetPeriod = period) => {
+    if (!canReview) {
+      openReportHistory(reportId)
+      return
+    }
     const report = fleetRef.current.reports.find((item) => item.id === reportId)
     const vehicle = report && fleetRef.current.vehicles.find((item) => item.id === report.vehicleId)
     if (vehicle && department !== 'All departments' && department !== vehicle.department) setDepartment('All departments')
@@ -828,13 +1167,15 @@ export default function FleetApp() {
       setTicketFormOpen(false)
       const ticket = fleetRef.current.tickets.find((candidate) => candidate.id === ticketId)
       if (ticket) {
-        setServiceEditId(ticket.id)
-        setServiceEdit(serviceEditFor(ticket))
+        if (canManageService) {
+          setServiceEditId(ticket.id)
+          setServiceEdit(serviceEditFor(ticket))
+        } else setServiceEditId(null)
         const vehicle = fleetRef.current.vehicles.find((candidate) => candidate.id === ticket.vehicleId)
         if (vehicle && department !== 'All departments' && department !== vehicle.department) setDepartment(vehicle.department)
       }
       setFocusTarget('fleet-ticket-' + ticketId)
-    } else if (vehicleId) {
+    } else if (vehicleId && canManageService) {
       setTicketDraft(blankTicketDraft(vehicleId))
       setTicketFormOpen(true)
       setSelectedTicketId(null)
@@ -890,12 +1231,13 @@ export default function FleetApp() {
     })
   }
 
-  const handleDepartmentSave = (event: FormEvent<HTMLFormElement>) => {
+  const handleDepartmentSave = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!editingDepartment) return
-    if (commit(
+    if (await commit(
       (current) => updateDepartmentProfile(current, editingDepartment, departmentDraft, 'Demo Fleet Admin'),
-      editingDepartment + ' accountability settings saved locally.',
+      editingDepartment + ' accountability settings saved.',
+      { type: 'update-department', payload: { name: editingDepartment, input: departmentDraft } },
     )) setEditingDepartment(null)
   }
 
@@ -906,11 +1248,12 @@ export default function FleetApp() {
     setFollowUpDueOn(localDateOffset(3))
   }
 
-  const handleFollowUp = (event: FormEvent<HTMLFormElement>, item: FleetException) => {
+  const handleFollowUp = async (event: FormEvent<HTMLFormElement>, item: FleetException) => {
     event.preventDefault()
-    if (commit(
+    if (await commit(
       (current) => recordReportFollowUp(current, item.vehicleId, period, followUpActor, followUpNote, followUpDueOn, followUpOwner),
       'Internal follow-up task created. No reminder or message was sent.',
+      { type: 'create-follow-up', payload: { vehicleId: item.vehicleId, period, note: followUpNote, dueOn: followUpDueOn, owner: followUpOwner } },
     )) {
       setFollowUpFor(null)
       setFollowUpNote('')
@@ -930,15 +1273,16 @@ export default function FleetApp() {
     setFocusTarget('fleet-follow-up-task-' + task.id)
   }
 
-  const saveTask = (task: FollowUp, close = false) => {
+  const saveTask = async (task: FollowUp, close = false) => {
     if (close && taskOutcome.trim().length < 5) {
       toast('Describe the outcome before closing the follow-up task.', 'error')
       return
     }
     const options = { owner: taskOwner, dueOn: taskDueOn, ...(close ? { outcome: taskOutcome } : {}) }
-    if (commit(
+    if (await commit(
       (current) => updateReportFollowUp(current, task.id, close ? 'Closed' : 'Open', taskActor, options),
       close ? 'Internal follow-up closed with outcome. Nothing was sent.' : 'Internal follow-up owner and due date updated.',
+      { type: 'update-follow-up', payload: { id: task.id, status: close ? 'Closed' : 'Open', options } },
     )) {
       setEditingFollowUpId(null)
       setTaskOutcome('')
@@ -954,7 +1298,7 @@ export default function FleetApp() {
     setVehicleStatusNote('')
   }
 
-  const handleVehicleEdit = (event: FormEvent<HTMLFormElement>) => {
+  const handleVehicleEdit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!vehicleEditId) return
     const patch: Partial<VehicleInput> = {
@@ -970,19 +1314,24 @@ export default function FleetApp() {
       custodian: vehicleEditDraft.custodian,
       notes: vehicleEditDraft.notes,
     }
-    if (commit((current) => updateVehicleRecord(current, vehicleEditId, patch, 'Demo Fleet Admin'), 'Vehicle record updated locally.')) {
+    if (await commit(
+      (current) => updateVehicleRecord(current, vehicleEditId, patch, 'Demo Fleet Admin'),
+      'Vehicle record updated.',
+      { type: 'update-vehicle', payload: { vehicleId: vehicleEditId, changes: patch } },
+    )) {
       setVehicleEditId(null)
       if (department !== 'All departments' && department !== patch.department) setDepartment('All departments')
     }
   }
 
-  const handleVehicleStatus = (vehicle: Vehicle) => {
+  const handleVehicleStatus = async (vehicle: Vehicle) => {
     if (vehicleStatusDraft === vehicle.status) return
-    if (vehicleStatusDraft === 'Retired' && !window.confirm('Retire ' + vehicle.unit + ' in this local demo? It will no longer be expected to submit new monthly reports.')) return
+    if (vehicleStatusDraft === 'Retired' && !window.confirm('Retire ' + vehicle.unit + '? This action affects ' + (sharedMode ? 'shared records' : 'the browser demo') + ' and stops future required reports.')) return
     if (vehicle.status === 'In maintenance' && vehicleStatusDraft === 'Active' && !window.confirm('Mark ' + vehicle.unit + ' active? Confirm the required real-world inspection or release is handled separately.')) return
-    if (commit(
+    if (await commit(
       (current) => setVehicleStatus(current, vehicle.id, vehicleStatusDraft, 'Demo Fleet Admin', vehicleStatusNote),
       vehicle.unit + ' status updated to ' + vehicleStatusDraft.toLowerCase() + '.',
+      { type: 'vehicle-status', payload: { vehicleId: vehicle.id, status: vehicleStatusDraft, note: vehicleStatusNote } },
     )) setVehicleStatusNote('')
   }
 
@@ -992,7 +1341,7 @@ export default function FleetApp() {
     setServiceEdit(serviceEditFor(ticket))
   }
 
-  const handleServiceUpdate = (event: FormEvent<HTMLFormElement>, ticket: MaintenanceTicket) => {
+  const handleServiceUpdate = async (event: FormEvent<HTMLFormElement>, ticket: MaintenanceTicket) => {
     event.preventDefault()
     if (serviceEdit.status === 'Resolved' && !serviceEdit.resolutionNote.trim() && !ticket.resolutionNote) {
       toast('Add a resolution note before resolving the issue.', 'error')
@@ -1017,9 +1366,10 @@ export default function FleetApp() {
       actualCost: serviceEdit.actualCost.trim() ? Number(serviceEdit.actualCost) : undefined,
       reopenReason: serviceEdit.reopenReason,
     }
-    if (commit(
+    if (await commit(
       (current) => updateMaintenanceTicket(current, ticket.id, serviceEdit.status, 'Demo ' + role, details),
       ticket.title + ' updated with service follow-through.',
+      { type: 'update-ticket', payload: { ticketId: ticket.id, status: serviceEdit.status, details } },
     )) {
       setServiceEditId(null)
       setTicketFilter('All')
@@ -1029,7 +1379,7 @@ export default function FleetApp() {
     }
   }
 
-  const handleReportSubmit = (event: FormEvent<HTMLFormElement>) => {
+  const handleReportSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!reportVehicleId) return toast('Choose a vehicle to report.', 'error')
     if (hardMileageError) return toast('Correct the odometer errors before submitting.', 'error')
@@ -1044,22 +1394,28 @@ export default function FleetApp() {
       notes: reportDraft.notes,
       operator: reportDraft.operator,
     }
-    if (commit((current) => submitMonthlyReport(current, input), 'Monthly report sent to the demo supervisor queue.')) {
+    if (await commit(
+      (current) => submitMonthlyReport(current, input),
+      sharedMode ? 'Monthly report submitted for supervisor review.' : 'Monthly report sent to the demo supervisor queue.',
+      { type: 'submit-report', payload: input },
+    )) {
       setReportsTab('history')
     }
   }
 
-  const handleReview = (reportId: string, decision: 'Approved' | 'Returned') => {
+  const handleReview = async (reportId: string, decision: 'Approved' | 'Returned') => {
     const note = reviewNotes[reportId] ?? ''
-    if (commit((current) => reviewMonthlyReport(current, reportId, decision, reviewer, note), decision === 'Approved'
-      ? 'Report approved in this local demo.'
-      : 'Report returned to driver for correction.')) {
+    if (await commit(
+      (current) => reviewMonthlyReport(current, reportId, decision, reviewer, note),
+      decision === 'Approved' ? 'Report approved.' : 'Report returned for correction.',
+      { type: 'review-report', payload: { reportId, decision, note } },
+    )) {
       setSelectedReviewId(null)
       setReviewNotes((previous) => ({ ...previous, [reportId]: '' }))
     }
   }
 
-  const handleAddVehicle = (event: FormEvent<HTMLFormElement>) => {
+  const handleAddVehicle = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const input: VehicleInput = {
       unit: vehicleDraft.unit,
@@ -1072,8 +1428,13 @@ export default function FleetApp() {
       licensed: vehicleDraft.licensed,
       odometer: Number(vehicleDraft.odometer),
       custodian: vehicleDraft.custodian,
+      notes: vehicleDraft.notes,
     }
-    if (commit((current) => addVehicle(current, input, 'Demo Fleet Admin'), 'Vehicle added to your local demo fleet.')) {
+    if (await commit(
+      (current) => addVehicle(current, input, 'Demo Fleet Admin'),
+      'Vehicle added.',
+      { type: 'add-vehicle', payload: { input } },
+    )) {
       const added = fleetRef.current.vehicles.find((vehicle) => vehicle.unit === vehicleDraft.unit.trim())
       if (added) setSelectedVehicleId(added.id)
       if (department !== 'All departments' && department !== vehicleDraft.department) setDepartment(vehicleDraft.department)
@@ -1082,7 +1443,7 @@ export default function FleetApp() {
     }
   }
 
-  const handleAddTicket = (event: FormEvent<HTMLFormElement>) => {
+  const handleAddTicket = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const input: TicketInput = {
       vehicleId: ticketDraft.vehicleId,
@@ -1091,15 +1452,24 @@ export default function FleetApp() {
       severity: ticketDraft.severity,
       assignee: ticketDraft.assignee,
     }
-    if (commit((current) => addMaintenanceTicket(current, input, 'Demo ' + role), 'Maintenance issue added to your local queue.')) {
+    if (await commit(
+      (current) => addMaintenanceTicket(current, input, 'Demo ' + role),
+      'Maintenance issue added to the queue.',
+      { type: 'add-ticket', payload: { input } },
+    )) {
       setTicketDraft(blankTicketDraft(ticketDraft.vehicleId))
       setTicketFormOpen(false)
       setTicketFilter('Active')
     }
   }
 
-  const downloadStagingCsv = (csv: string, count: number, filename: string, scope: 'Monthly' | 'Quarterly', label: string) => {
+  const downloadStagingCsv = async (csv: string, count: number, filename: string, scope: 'Monthly' | 'Quarterly', label: string) => {
     if (!count) return toast('No vehicles or reports match the selected review scope.', 'error')
+    if (!await commit(
+      (current) => recordExportPreparation(current, scope, label, count, 'Demo Fleet Admin'),
+      scope + ' review-only CSV prepared and logged. No TxFS submission occurred.',
+      { type: 'record-export', payload: { scope, label, recordCount: count } },
+    )) return
     try {
       const file = new Blob(['\uFEFF', csv], { type: 'text/csv;charset=utf-8' })
       const url = URL.createObjectURL(file)
@@ -1110,10 +1480,6 @@ export default function FleetApp() {
       a.click()
       a.remove()
       setTimeout(() => URL.revokeObjectURL(url), 5000)
-      commit(
-        (current) => recordExportPreparation(current, scope, label, count, 'Demo Fleet Admin'),
-        scope + ' reconciliation worksheet downloaded locally and logged. No TxFS submission occurred.',
-      )
     } catch (error) {
       toast(error instanceof Error ? error.message : 'CSV download failed.', 'error')
     }
@@ -1159,26 +1525,28 @@ export default function FleetApp() {
     setCorrectionRequest({ reportId: report.id, vehicleId: vehicle.id, period: report.period, reason: '' })
   }
 
-  const submitApprovedCorrection = (event: FormEvent<HTMLFormElement>) => {
+  const submitApprovedCorrection = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!correctionRequest) return
     if (correctionRequest.reason.trim().length < 5) {
       toast('Record why the approved report needs a correction.', 'error')
       return
     }
-    if (commit(
+    if (await commit(
       (current) => reopenApprovedReportForCorrection(current, correctionRequest.reportId, 'Demo ' + role, correctionRequest.reason),
-      'Approved snapshot retained. Report reopened for correction in the local demo.',
+      'Approved snapshot retained. Report reopened for correction.',
+      { type: 'reopen-report', payload: { reportId: correctionRequest.reportId, reason: correctionRequest.reason } },
     )) {
       const { vehicleId, period: targetPeriod } = correctionRequest
       setCorrectionRequest(null)
       openReport(vehicleId, targetPeriod)
     }
   }
-  const resetDemo = () => {
+  const resetDemo = async () => {
+    if (sharedMode) return
     if (!window.confirm('Reset FleetSync to fictional sample records? Your changes saved in this browser will be replaced.')) return
     const next = createDemoFleet(currentPeriod())
-    if (!commit(() => next, 'Fictional demo records restored.')) return
+    if (!await commit(() => next, 'Fictional demo records restored.')) return
     setPeriod(currentPeriod())
     setDepartment('All departments')
     setView('overview')
@@ -1201,6 +1569,9 @@ export default function FleetApp() {
     setCorrectionRequest(null)
     setExpandedReportId(null)
     setTicketFilter('Active')
+    setWorkSearch('')
+    setWorkPriority('All')
+    setWorkAssignment('All')
     setVehicleSearch('')
     setAuditSearch('')
     setShowAllExceptions(false)
@@ -1222,8 +1593,41 @@ export default function FleetApp() {
   const completion = Math.max(0, Math.min(100, metrics.completion))
   const navCurrent = NAV.find((item) => item.id === view) ?? NAV[0]
 
+  if (sharedMode && sharedStatus !== 'ready') {
+    return (
+      <div className="fleet-app fleet-app--auth" data-mode="shared" data-role={role}>
+        <main className="fleet-auth-layout" id="fleet-main">
+          <div className="fleet-auth-panel">
+            <div className="fleet-auth-heading"><span className="fleet-brand-mark"><Truck size={22} /></span><span><strong>FleetSync Operations</strong><small>SHARED RECORDS · LOCAL SERVER</small></span></div>
+            <h1>{sharedStatus === 'checking' ? 'Connecting to shared records' : sharedStatus === 'error' ? 'Shared records unavailable' : 'Sign in to shared records'}</h1>
+            <p className="fleet-text-muted">Shared records use a separate local server with authenticated users, department scope, and server-checked permissions. Browser-local Demo data is not imported automatically.</p>
+            {sharedError && <div className="fleet-banner fleet-banner--warning" role="alert"><AlertTriangle size={18} /><span>{sharedError}</span></div>}
+            {sharedStatus === 'checking' && <p className="fleet-auth-loading" role="status"><Clock3 size={18} /> Checking local server and session…</p>}
+            {sharedStatus === 'login' && (
+              <form className="fleet-form fleet-auth-form" onSubmit={loginToShared} aria-label="Shared records login">
+                <Field htmlFor="fleet-shared-username" label="Username">
+                  <input id="fleet-shared-username" className="fleet-input" autoComplete="username" value={sharedUsername} onChange={(event) => setSharedUsername(event.target.value)} required maxLength={100} disabled={sharedBusy} />
+                </Field>
+                <Field htmlFor="fleet-shared-password" label="Password">
+                  <input id="fleet-shared-password" className="fleet-input" type="password" autoComplete="current-password" value={sharedPassword} onChange={(event) => setSharedPassword(event.target.value)} required disabled={sharedBusy} />
+                </Field>
+                <button type="submit" className="fleet-button fleet-button--primary" disabled={sharedBusy || !sharedUsername.trim() || !sharedPassword}>{sharedBusy ? 'Signing in…' : 'Sign in'} <ArrowRight size={16} /></button>
+                <p className="fleet-text-muted">Accounts are administered locally. These are not UT Dallas credentials.</p>
+              </form>
+            )}
+            <div className="fleet-auth-actions">
+              {sharedStatus === 'error' && <button className="fleet-button fleet-button--primary" type="button" disabled={sharedBusy} onClick={openSharedRecords}>Retry shared connection</button>}
+              <button className="fleet-button fleet-button--quiet" type="button" disabled={sharedBusy} onClick={leaveSharedRecords}><ArrowLeft size={16} /> Back to browser Demo</button>
+            </div>
+          </div>
+          <p className="fleet-auth-footnote">The shared server is loopback-only. Neither workspace connects to university vehicle systems or submits TxFS reports.</p>
+        </main>
+      </div>
+    )
+  }
+
   return (
-    <div className="fleet-app" data-role={role}>
+    <div className="fleet-app" data-mode={connectionMode} data-role={role} data-pending={sharedBusy ? 'true' : 'false'}>
       <a className="fleet-skip-link" href="#fleet-main">Skip to main content</a>
       {mobileNavOpen && (
         <button
@@ -1242,11 +1646,12 @@ export default function FleetApp() {
         <div className="fleet-sidebar__body">
           <div className="fleet-nav-label fleet-nav__eyebrow">OPERATIONS</div>
           <nav className="fleet-nav" aria-label="Main navigation">
-            {NAV.map((item) => {
+            {navItems.map((item) => {
               const Icon = item.icon
               return (
                 <button
                   type="button"
+                  disabled={sharedBusy}
                   key={item.id}
                   className={'fleet-nav__item ' + (view === item.id ? 'is-active' : '')}
                   aria-current={view === item.id ? 'page' : undefined}
@@ -1267,10 +1672,21 @@ export default function FleetApp() {
           </a>
         </div>
         <div className="fleet-sidebar__footer">
-          <div className="fleet-sidebar__demo"><strong>Demonstration workspace</strong></div>
-          <p>Fictional records stored in this browser.</p>
-          <button type="button" className="fleet-sidebar__reset" onClick={resetDemo}><RotateCcw size={15} /> Reset demo data</button>
-          <span className="fleet-sidebar__version">Not connected to university systems</span>
+          <div className="fleet-sidebar__demo"><strong>{sharedMode ? 'Shared records' : 'Browser Demo'}</strong></div>
+          <p>{sharedMode ? 'Authenticated local-server records. Changes are shared between signed-in sessions.' : 'Fictional records stay in this browser unless you explicitly import them.'}</p>
+          {sharedMode ? (
+            <div className="fleet-sidebar__session-actions">
+              <small>{sharedUser?.displayName} · {sharedUser?.role}</small>
+              <button type="button" className="fleet-sidebar__reset" disabled={sharedBusy} onClick={logoutFromShared}>Log out</button>
+              <button type="button" className="fleet-sidebar__reset" disabled={sharedBusy} onClick={leaveSharedRecords}>Back to Demo</button>
+            </div>
+          ) : (
+            <>
+              <button type="button" className="fleet-sidebar__reset" onClick={openSharedRecords}><UserRound size={15} /> Open Shared records</button>
+              <button type="button" className="fleet-sidebar__reset" onClick={resetDemo}><RotateCcw size={15} /> Reset demo data</button>
+            </>
+          )}
+          <span className="fleet-sidebar__version">No UT Dallas / TxFS integration</span>
         </div>
       </aside>
 
@@ -1282,6 +1698,18 @@ export default function FleetApp() {
           </div>
           <div className="fleet-topbar-right fleet-topbar__right">
             <a className="fleet-topbar__map-link" href="/campus-map"><MapPinned size={17} /> Campus map <ExternalLink size={13} /></a>
+            {sharedMode ? (
+              <div className="fleet-shared-identity" title={sharedUser?.department ?? 'All departments'}>
+                <span className="fleet-workspace-badge">Shared records</span>
+                <UserRound size={16} />
+                <span className="fleet-shared-identity__text"><strong>{sharedUser?.displayName}</strong><small>{sharedUser?.role}{sharedUser?.department ? ' · ' + sharedUser.department : ''}</small></span>
+                <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" disabled={sharedBusy} onClick={refreshSharedRecords}><RotateCcw size={14} /> Refresh</button>
+                <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" disabled={sharedBusy} onClick={logoutFromShared}>Log out</button>
+                <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" disabled={sharedBusy} onClick={leaveSharedRecords}>Demo</button>
+              </div>
+            ) : (
+            <>
+            <button className="fleet-button fleet-button--small fleet-button--quiet fleet-shared-open" type="button" onClick={openSharedRecords}><UserRound size={15} /> Shared records</button>
             <div className="fleet-role-switch">
               <UserRound size={17} />
               <label className="fleet-sr-only" htmlFor="fleet-role">Switch demo role</label>
@@ -1290,39 +1718,87 @@ export default function FleetApp() {
               </select>
               <ChevronDown size={14} aria-hidden="true" />
             </div>
+            </>
+            )}
           </div>
         </header>
 
-        <main id="fleet-main" className="fleet-main" tabIndex={-1}>
+        <main id="fleet-main" className="fleet-main" tabIndex={-1} aria-busy={sharedBusy}>
           <div className="fleet-demo-notice" role="note">
             <Info size={16} />
-            <span><strong>Demo roles, not access control.</strong> Sample records and workflows are fictional. This prototype does not connect to UT Dallas systems or TxFS.</span>
+            {sharedMode
+              ? <span><strong>Shared records · authenticated local server.</strong> Signed in as {sharedUser?.displayName} ({sharedUser?.role}). The server enforces permissions and records changes. This is not UT Dallas or TxFS integration.</span>
+              : <span><strong>Browser-local Demo · roles are not access control.</strong> Sample records and workflows are fictional. This prototype does not connect to UT Dallas systems or TxFS.</span>}
           </div>
+          {sharedMode && sharedError && <div className="fleet-banner fleet-banner--warning fleet-shared-error" role="alert"><AlertTriangle size={18} /><span>{sharedError}</span><button type="button" className="fleet-button fleet-button--small fleet-button--quiet" onClick={leaveSharedRecords}>Back to Demo</button><button type="button" className="fleet-button fleet-button--small fleet-button--quiet" onClick={() => setSharedError('')}>Dismiss</button></div>}
 
-          <div className="fleet-page">
+          <div className="fleet-page" data-workspace={role === 'Driver' ? 'driver' : role === 'Supervisor' ? 'supervisor' : role === 'Maintenance' ? 'maintenance' : 'admin'} inert={sharedMode && sharedBusy}>
+            {sharedMode && canManageFleet && (
+              <section className="fleet-shared-import" aria-label="Import browser Demo records">
+                <div className="fleet-shared-import__header">
+                  <div><strong>Shared database</strong><span> {fleet.vehicles.length} vehicles · {fleet.reports.length} reports · {fleet.tickets.length} work orders</span></div>
+                  <button type="button" className="fleet-button fleet-button--small fleet-button--quiet" aria-expanded={importPanelOpen} onClick={() => {
+                    setImportPanelOpen((open) => !open)
+                    setImportPreview(null)
+                    setImportConfirmed(false)
+                  }}>{importPanelOpen ? 'Close import' : 'Import browser Demo data'}</button>
+                </div>
+                {importPanelOpen && (
+                  <div className="fleet-shared-import__body">
+                    <h2>Optional one-time import to an empty shared database</h2>
+                    <p>Copy a snapshot of this browser's separate Demo records into shared storage. Nothing is copied automatically. Import never merges or overwrites an existing shared fleet, and it does not submit data to TxFS.</p>
+                    <p className="fleet-text-muted">Available Demo snapshot: {demoSnapshotRef.current.vehicles.length} vehicles · {demoSnapshotRef.current.reports.length} reports · {demoSnapshotRef.current.tickets.length} work orders.</p>
+                    {!importPreview && <button type="button" className="fleet-button fleet-button--quiet" disabled={sharedBusy} onClick={previewDemoImport}>Preview import with server <ArrowRight size={16} /></button>}
+                    {importPreview && (
+                      <div className="fleet-shared-import__preview">
+                        <strong>{importPreview.allowed ? 'Server preview: eligible for one-time import' : 'Server preview: import blocked'}</strong>
+                        <p>{importPreview.reason}</p>
+                        <div className="fleet-shared-import__counts">
+                          <span>{importPreview.counts.vehicles} vehicles</span><span>{importPreview.counts.reports} reports</span><span>{importPreview.counts.tickets} work orders</span><span>{importPreview.counts.followUps} follow-ups</span>
+                        </div>
+                        {importPreview.allowed && (
+                          <>
+                            <label className="fleet-checkbox-field fleet-shared-import__confirm"><input type="checkbox" checked={importConfirmed} onChange={(event) => setImportConfirmed(event.target.checked)} /> I understand this copies my browser Demo snapshot into the empty shared database and makes it visible to signed-in users.</label>
+                            <button className="fleet-button fleet-button--primary" type="button" disabled={!importConfirmed || sharedBusy} onClick={importDemoData}>Confirm import to shared records</button>
+                          </>
+                        )}
+                        <button className="fleet-button fleet-button--quiet" type="button" disabled={sharedBusy} onClick={() => { setImportPreview(null); setImportConfirmed(false) }}>Preview again</button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+            )}
             <div className="fleet-page-heading fleet-header">
               <div className="fleet-page-heading__copy">
-                <span className="fleet-eyebrow">{view === 'overview' ? displayPeriod(period) + ' · ' + department : navCurrent.description}</span>
-                <h1>{view === 'overview' ? 'Exceptions and reporting' : navCurrent.label}</h1>
+                <span className="fleet-eyebrow">{sharedMode ? (sharedUser?.role + (sharedUser?.department ? ' · ' + sharedUser.department : ' · Cross-department')) : 'DEMO ROLE · ' + role}{' · '}{displayPeriod(period)}</span>
+                <h1>
+                  {view === 'reports' && role === 'Driver' ? 'My monthly report'
+                    : view === 'reports' && role === 'Supervisor' ? 'Department review queue'
+                      : view === 'maintenance' && role === 'Maintenance' ? 'Technician work orders'
+                        : view === 'overview' ? (sharedMode ? 'Fleet exceptions and assignments' : 'Exceptions and reporting') : navCurrent.label}
+                </h1>
                 <p>
-                  {view === 'overview' && 'Open actions, department reporting deadlines, and unresolved service work.'}
-                  {view === 'reports' && role !== 'Driver' && 'Submit mileage and condition records. Approve or return department reports.'}
+                  {view === 'overview' && 'Resolve reporting, department accountability, follow-ups, and service exceptions.'}
+                {view === 'reports' && role === 'Driver' && 'Record your department vehicle mileage and condition, then track approval or corrections.'}
+                  {view === 'reports' && role === 'Supervisor' && 'Review department submissions, return corrections, and track missing reports.'}
+                  {view === 'reports' && role !== 'Driver' && role !== 'Supervisor' && 'Review submitted reports, corrections and approval history.'}
                   {view === 'vehicles' && 'Vehicle details, assigned departments, custodians, and service status.'}
-                  {view === 'maintenance' && 'Assign, schedule, and document vehicle maintenance work.'}
+                  {view === 'maintenance' && 'Assign work, schedule service, and record resolution with a retained audit history.'}
                   {view === 'exports' && 'Reconcile three monthly periods and prepare review-only CSV worksheets.'}
                 </p>
               </div>
               <div className="fleet-page-heading__actions">
-                {view === 'overview' && <button className="fleet-button fleet-button--primary" type="button" onClick={() => {
+                {view === 'overview' && canSubmit && <button className="fleet-button fleet-button--primary" type="button" onClick={() => {
                   const vehicle = preferredReportVehicle(fleetRef.current, period, department)
                   setReportVehicleId(vehicle?.id ?? '')
                   setReportDraft(reportDraftFor(fleetRef.current, vehicle, period))
                   setReportsTab('submit')
                   changePage('reports')
                 }}><Plus size={17} /> New report</button>}
-                {view === 'vehicles' && <button className="fleet-button fleet-button--primary" type="button" onClick={() => setVehicleFormOpen(true)}><Plus size={17} /> Add vehicle</button>}
-                {view === 'maintenance' && <button className="fleet-button fleet-button--primary" type="button" onClick={() => { setTicketDraft(blankTicketDraft(filteredVehicles[0]?.id)); setTicketFormOpen(true) }}><Plus size={17} /> New issue</button>}
-                {view === 'exports' && <button className="fleet-button fleet-button--primary" type="button" disabled={!exportData.count} onClick={downloadCsv}><Download size={17} /> Download monthly CSV</button>}
+                {view === 'vehicles' && canManageFleet && <button className="fleet-button fleet-button--primary" type="button" onClick={() => setVehicleFormOpen(true)}><Plus size={17} /> Add vehicle</button>}
+                {view === 'maintenance' && canManageService && <button className="fleet-button fleet-button--primary" type="button" onClick={() => { setTicketDraft(blankTicketDraft(filteredVehicles[0]?.id)); setTicketFormOpen(true) }}><Plus size={17} /> {sharedMode ? 'New work order' : 'New issue'}</button>}
+                {view === 'exports' && canManageFleet && <button className="fleet-button fleet-button--primary" type="button" disabled={!exportData.count || sharedBusy} onClick={downloadCsv}><Download size={17} /> Download monthly CSV</button>}
               </div>
             </div>
 
@@ -1339,8 +1815,8 @@ export default function FleetApp() {
               <div className="fleet-filter">
                 <Building2 size={17} />
                 <label htmlFor="fleet-department">Department</label>
-                <select id="fleet-department" className="fleet-select" value={department} onChange={(event) => setDepartment(event.target.value)}>
-                  <option>All departments</option>
+                <select id="fleet-department" className="fleet-select" value={department} disabled={sharedMode && sharedUser?.role !== 'Fleet Admin' && sharedUser?.role !== 'Maintenance'} onChange={(event) => setDepartment(event.target.value)}>
+                  {(!sharedMode || sharedUser?.role === 'Fleet Admin' || sharedUser?.role === 'Maintenance') && <option>All departments</option>}
                   {departments.map((item) => <option key={item} value={item}>{item}</option>)}
                 </select>
               </div>
@@ -1349,7 +1825,7 @@ export default function FleetApp() {
 
             {view === 'overview' && (
               <>
-                <div className="fleet-ops-summary" aria-label="Current fleet status">
+              <div className="fleet-ops-summary" data-testid={role === 'Fleet Admin' ? 'admin-workspace' : undefined} aria-label="Current fleet status">
                   {[
                     { label: 'Units expected to report', value: metrics.vehicles, detail: metrics.licensed + ' licensed' },
                     { label: 'Reporting coverage', value: completion + '%', detail: metrics.reported + ' submitted' },
@@ -1395,7 +1871,7 @@ export default function FleetApp() {
                                   <td>{item.dueDate ? dateLabel(item.dueDate) : '—'}{typeof item.daysOverdue === 'number' && item.daysOverdue > 0 && <small className="fleet-table__meta fleet-urgency">{item.daysOverdue} days overdue</small>}</td>
                                   <td><div className="fleet-exception__actions">
                                     <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => exceptionAction(item)} aria-label={actionLabel + ' for ' + item.label}>{actionLabel} <ArrowRight size={14} /></button>
-                                    {isReporting && (activeTask
+                                    {isReporting && canManageFollowUps && (activeTask
                                       ? <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => beginTaskEdit(activeTask)}>Manage task</button>
                                       : <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" aria-expanded={followUpFor === item.id} onClick={() => followUpFor === item.id ? setFollowUpFor(null) : beginFollowUp(item)}>Create follow-up</button>)}
                                   </div></td>
@@ -1405,7 +1881,7 @@ export default function FleetApp() {
                                     <form className="fleet-form fleet-follow-up-form" onSubmit={(event) => handleFollowUp(event, item)}>
                                       <div className="fleet-profile-form__heading"><h3>Record internal follow-up · {item.label}</h3><button type="button" className="fleet-icon-button" aria-label="Close follow-up form" onClick={() => setFollowUpFor(null)}><X size={17} /></button></div>
                                       <div className="fleet-form-grid">
-                                        <Field htmlFor={'follow-actor-' + item.id} label="Recorded by"><input id={'follow-actor-' + item.id} className="fleet-input" value={followUpActor} maxLength={80} minLength={2} required onChange={(event) => setFollowUpActor(event.target.value)} /></Field>
+                                        <Field htmlFor={'follow-actor-' + item.id} label="Recorded by"><input id={'follow-actor-' + item.id} className="fleet-input" value={followUpActor} maxLength={80} minLength={2} required readOnly={sharedMode} onChange={(event) => setFollowUpActor(event.target.value)} /></Field>
                                         <Field htmlFor={'follow-owner-' + item.id} label="Responsible owner"><input id={'follow-owner-' + item.id} className="fleet-input" value={followUpOwner} minLength={2} maxLength={80} required onChange={(event) => setFollowUpOwner(event.target.value)} /></Field>
                                         <Field htmlFor={'follow-due-' + item.id} label="Next check-in date"><input id={'follow-due-' + item.id} className="fleet-input" type="date" min={localDateOffset(0)} value={followUpDueOn} required onChange={(event) => setFollowUpDueOn(event.target.value)} /></Field>
                                         <Field htmlFor={'follow-note-' + item.id} label="Internal task note" hint="This schedules a local task, not an email, SMS, or external reminder." className="fleet-field--full"><textarea id={'follow-note-' + item.id} className="fleet-textarea" value={followUpNote} rows={2} minLength={5} maxLength={400} required placeholder="Record planned action and follow-up target" onChange={(event) => setFollowUpNote(event.target.value)} /></Field>
@@ -1452,7 +1928,7 @@ export default function FleetApp() {
                                   <td><strong>{task.note}</strong>{task.outcome && <small className="fleet-table__meta">Outcome: {task.outcome}</small>}{closed && task.closedBy && <small className="fleet-table__meta">Closed by {task.closedBy}</small>}</td>
                                   <td><Tone tone={closed ? 'approved' : overdue ? 'high' : 'pending'}>{closed ? 'Closed' : 'Open'}</Tone></td>
                                   <td><div className="fleet-exception__actions">
-                                    {!closed && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => beginTaskEdit(task)} aria-expanded={editingFollowUpId === task.id}>Update task</button>}
+                                    {!closed && canManageFollowUps && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => beginTaskEdit(task)} aria-expanded={editingFollowUpId === task.id}>Update task</button>}
                                     <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => {
                                       const report = activeReportFor(fleet, task.vehicleId, task.period)
                                       if (report?.status === 'Pending') openReview(report.id, task.period)
@@ -1466,7 +1942,7 @@ export default function FleetApp() {
                                     <form className="fleet-form fleet-follow-up-form" onSubmit={(event) => { event.preventDefault(); saveTask(task) }}>
                                       <div className="fleet-profile-form__heading"><h3>Update follow-up · {vehicle?.unit ?? task.vehicleId}</h3><button className="fleet-icon-button" type="button" aria-label="Close task editor" onClick={() => setEditingFollowUpId(null)}><X size={18} /></button></div>
                                       <div className="fleet-form-grid fleet-form-grid--wide">
-                                        <Field htmlFor={'task-editor-' + task.id} label="Updated by"><input id={'task-editor-' + task.id} className="fleet-input" minLength={2} maxLength={80} required value={taskActor} onChange={(event) => setTaskActor(event.target.value)} /></Field>
+                                        <Field htmlFor={'task-editor-' + task.id} label="Updated by"><input id={'task-editor-' + task.id} className="fleet-input" minLength={2} maxLength={80} required readOnly={sharedMode} value={taskActor} onChange={(event) => setTaskActor(event.target.value)} /></Field>
                                         <Field htmlFor={'task-owner-' + task.id} label="Responsible owner"><input id={'task-owner-' + task.id} className="fleet-input" minLength={2} maxLength={80} required value={taskOwner} onChange={(event) => setTaskOwner(event.target.value)} /></Field>
                                         <Field htmlFor={'task-due-' + task.id} label="Next check-in date"><input id={'task-due-' + task.id} className="fleet-input" type="date" value={taskDueOn} required onChange={(event) => setTaskDueOn(event.target.value)} /></Field>
                                         <Field htmlFor={'task-outcome-' + task.id} label="Outcome or contact result (required to close)" className="fleet-field--full"><textarea id={'task-outcome-' + task.id} className="fleet-textarea" rows={2} minLength={5} maxLength={400} value={taskOutcome} onChange={(event) => setTaskOutcome(event.target.value)} placeholder="Record the actual response, completed action, or reason no action was taken" /></Field>
@@ -1490,7 +1966,7 @@ export default function FleetApp() {
                 </FleetCard>
 
                 <FleetCard className="fleet-department-scorecard">
-                  <SectionTitle title="Reporting by department" description="Assigned coordinator, due day, approval progress and overdue items. Due dates are configurable demo policy, not a verified university deadline." action={<Tone tone="muted">{scorecardVisible.length} departments</Tone>} />
+                  <SectionTitle title="Reporting by department" description="Assigned coordinator, due day, approval progress and overdue items. Due dates are local policy settings, not verified university deadlines." action={<Tone tone="muted">{scorecardVisible.length} departments</Tone>} />
                   <div className="fleet-table-wrap">
                     <table className="fleet-table fleet-scorecard-table">
                       <thead><tr><th scope="col">Department / coordinator</th><th scope="col">Due</th><th scope="col">Reports</th><th scope="col">Exceptions</th><th scope="col">Actions</th></tr></thead>
@@ -1500,12 +1976,12 @@ export default function FleetApp() {
                           <td>{dateLabel(row.dueDate)}<small className="fleet-table__meta">Day {row.profile?.monthlyDueDay ?? 5}</small></td>
                           <td><div className="fleet-scorecard-metrics"><strong>{row.approved}/{row.vehicles} approved</strong><span>{row.completion}%</span></div><div className="fleet-progress fleet-progress--compact"><span style={{ width: Math.min(100, row.completion) + '%' }} /></div><small className="fleet-table__meta">{row.submitted} submitted · {row.pending} pending</small></td>
                           <td>{row.overdue > 0 ? <Tone tone="high">{row.overdue} overdue</Tone> : row.missing > 0 || row.returned > 0 ? <Tone tone="pending">{row.missing} missing · {row.returned} returned</Tone> : <Tone tone="approved">On track</Tone>}</td>
-                          <td><div className="fleet-scorecard-row__actions"><button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => beginDepartmentEdit(row.name)}><Settings2 size={15} /> Edit</button><button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => { setDepartment(row.name); setExceptionFilter('All') }}>Focus <ArrowRight size={14} /></button></div></td>
+                          <td><div className="fleet-scorecard-row__actions">{canManageFleet && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => beginDepartmentEdit(row.name)}><Settings2 size={15} /> Edit</button>}<button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => { setDepartment(row.name); setExceptionFilter('All') }}>Focus <ArrowRight size={14} /></button></div></td>
                         </tr>
                       ))}</tbody>
                     </table>
                   </div>
-                  {editingDepartment && (
+                {editingDepartment && canManageFleet && (
                     <form className="fleet-form fleet-profile-form" onSubmit={handleDepartmentSave}>
                       <div className="fleet-profile-form__heading"><h3>Edit {editingDepartment} coordination</h3><button type="button" className="fleet-icon-button" aria-label="Close department settings" onClick={() => setEditingDepartment(null)}><X size={18} /></button></div>
                       <div className="fleet-form-grid fleet-form-grid--wide">
@@ -1563,7 +2039,7 @@ export default function FleetApp() {
                 </div>
 
                 <FleetCard>
-                    <SectionTitle title="Recent audit activity" description="Actions recorded in this browser. This is a demo activity history." action={<button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => changePage('exports')}>View audit log <ArrowRight size={15} /></button>} />
+                    <SectionTitle title="Recent audit activity" description={sharedMode ? 'Activity recorded on the authenticated local server. Not a certified immutable audit log.' : 'Actions recorded in this browser Demo.'} action={canManageFleet ? <button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => changePage('exports')}>View audit log <ArrowRight size={15} /></button> : undefined} />
                   <div className="fleet-audit-list fleet-audit-list--compact">
                     {auditEntries.slice(0, 4).map((entry) => (
                       <div className="fleet-audit-row" key={entry.id}>
@@ -1578,12 +2054,44 @@ export default function FleetApp() {
 
             {view === 'reports' && (
               <>
+                {role === 'Driver' && (
+                  <section className="fleet-role-summary fleet-role-summary--driver" data-testid="driver-workspace" aria-label="Driver monthly report status">
+                    <div className="fleet-role-summary__body">
+                      <span className="fleet-eyebrow">MY REPORT · {displayPeriod(period)}</span>
+                      <strong>{reportVehicle ? reportVehicle.unit + ' · ' + reportVehicle.year + ' ' + reportVehicle.make + ' ' + reportVehicle.model : 'No assigned vehicle in this month'}</strong>
+                      <span>{reportExisting?.status === 'Returned' ? 'Returned for correction. Review the supervisor note and resubmit.' :
+                        reportExisting?.status === 'Pending' ? 'Submitted and awaiting supervisor review.' :
+                          reportExisting?.status === 'Approved' ? 'Approved. No further action for this month.' :
+                            'Not yet submitted. Enter the actual odometer readings and usage.'}</span>
+                      {reportExisting?.reviewNote && <small><strong>Supervisor note: </strong>{reportExisting.reviewNote}</small>}
+                    </div>
+                    <div className="fleet-role-summary__actions">
+                      <Tone tone={reportExisting?.status.toLowerCase() ?? 'pending'}>{reportExisting?.status ?? 'Missing'}</Tone>
+                      <button type="button" className="fleet-button fleet-button--small fleet-button--primary" onClick={() => { setReportsTab('submit'); setFocusTarget('fleet-report-form') }}>Open monthly form <ArrowRight size={15} /></button>
+                    </div>
+                  </section>
+                )}
+                {role === 'Supervisor' && (
+                  <section className="fleet-role-summary fleet-role-summary--supervisor" data-testid="supervisor-workspace" aria-label="Supervisor department review status">
+                    <div className="fleet-role-summary__body"><span className="fleet-eyebrow">DEPARTMENT APPROVALS · {displayPeriod(period)}</span><strong>{department === 'All departments' ? 'Reporting responsibility' : department + ' submissions'}</strong><span>Approve complete reports, return corrections with a reason, and follow up on missing records.</span></div>
+                    <div className="fleet-role-summary__counts">
+                      <span><strong>{pendingReports.length}</strong> awaiting review</span>
+                      <span><strong>{metrics.missing}</strong> missing</span>
+                      <span><strong>{metrics.returned}</strong> returned</span>
+                      <span><strong>{openFollowUpTasks.length}</strong> open follow-ups</span>
+                    </div>
+                    <div className="fleet-role-summary__actions">
+                      {pendingReports[0] && <button type="button" className="fleet-button fleet-button--primary fleet-button--small" onClick={() => openReview(pendingReports[0].id)}>Review next report <ArrowRight size={15} /></button>}
+                      <button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => changePage('overview')}>Reporting exceptions</button>
+                    </div>
+                  </section>
+                )}
                 <div className="fleet-tabs" role="tablist" aria-label="Monthly report workflows">
-                  <button id="fleet-report-submit-tab" role="tab" type="button" className={'fleet-tab ' + (reportsTab === 'submit' ? 'is-active' : '')} aria-selected={reportsTab === 'submit'} onClick={() => setReportsTab('submit')}><Send size={17} /> Submit report</button>
-                  <button id="fleet-report-review-tab" role="tab" type="button" className={'fleet-tab ' + (reportsTab === 'review' ? 'is-active' : '')} aria-selected={reportsTab === 'review'} onClick={() => setReportsTab('review')}><ClipboardCheck size={17} /> Supervisor review <span className="fleet-tab__count">{pendingReports.length}</span></button>
-                  <button id="fleet-report-history-tab" role="tab" type="button" className={'fleet-tab ' + (reportsTab === 'history' ? 'is-active' : '')} aria-selected={reportsTab === 'history'} onClick={() => setReportsTab('history')}><History size={17} /> All reports</button>
+                  {canSubmit && <button id="fleet-report-submit-tab" role="tab" type="button" className={'fleet-tab ' + (reportsTab === 'submit' ? 'is-active' : '')} aria-selected={reportsTab === 'submit'} onClick={() => setReportsTab('submit')}><Send size={17} /> {role === 'Driver' ? 'My monthly form' : 'Submit report'}</button>}
+                  {canReview && <button id="fleet-report-review-tab" role="tab" type="button" className={'fleet-tab ' + (reportsTab === 'review' ? 'is-active' : '')} aria-selected={reportsTab === 'review'} onClick={() => setReportsTab('review')}><ClipboardCheck size={17} /> {role === 'Supervisor' ? 'Department review' : 'Supervisor review'} <span className="fleet-tab__count">{pendingReports.length}</span></button>}
+                  <button id="fleet-report-history-tab" role="tab" type="button" className={'fleet-tab ' + (reportsTab === 'history' ? 'is-active' : '')} aria-selected={reportsTab === 'history'} onClick={() => setReportsTab('history')}><History size={17} /> {role === 'Driver' ? 'Department report history' : 'All reports'}</button>
                 </div>
-                {reportsTab === 'submit' && (
+                {reportsTab === 'submit' && canSubmit && (
                   <div role="tabpanel" aria-labelledby="fleet-report-submit-tab" className="fleet-grid fleet-reports-layout">
                     <FleetCard>
                       <SectionTitle eyebrow="DRIVER ENTRY" title="Monthly vehicle use report" description={role === 'Driver' ? undefined : 'Record vehicle activity for ' + displayPeriod(period) + '. A supervisor can approve or return the submission.'} />
@@ -1595,7 +2103,10 @@ export default function FleetApp() {
                               const id = event.target.value
                               const vehicle = fleet.vehicles.find((item) => item.id === id)
                               setReportVehicleId(id)
-                              setReportDraft(reportDraftFor(fleet, vehicle, period))
+                              setReportDraft({
+                                ...reportDraftFor(fleet, vehicle, period),
+                                ...(sharedMode && sharedUser?.role === 'Driver' ? { operator: sharedUser.displayName } : {}),
+                              })
                             }}>
                               {filteredVehicles.filter((vehicle) => requiresMonthlyReport(vehicle, period)).map((vehicle) => <option key={vehicle.id} value={vehicle.id}>{vehicle.unit} · {vehicle.year} {vehicle.make} {vehicle.model}</option>)}
                             </select>
@@ -1618,7 +2129,7 @@ export default function FleetApp() {
                             </select>
                           </Field>
                           <Field label="Driver / operator name" htmlFor="fleet-report-operator">
-                            <input className="fleet-input" id="fleet-report-operator" value={reportDraft.operator} onChange={(event) => setReportDraft((draft) => ({ ...draft, operator: event.target.value }))} placeholder="e.g. Demo Operator" maxLength={80} required disabled={Boolean(reportExisting && reportExisting.status !== 'Returned')} />
+                            <input className="fleet-input" id="fleet-report-operator" value={reportDraft.operator} onChange={(event) => setReportDraft((draft) => ({ ...draft, operator: event.target.value }))} placeholder="e.g. Demo Operator" maxLength={80} required readOnly={sharedMode} disabled={Boolean(reportExisting && reportExisting.status !== 'Returned')} />
                           </Field>
                           <Field label="Condition / usage notes" htmlFor="fleet-report-notes" hint="Required if the condition is Needs attention or Unsafe." className="fleet-field--full">
                             <textarea className="fleet-textarea" id="fleet-report-notes" value={reportDraft.notes} onChange={(event) => setReportDraft((draft) => ({ ...draft, notes: event.target.value }))} maxLength={1200} rows={4} placeholder="Record issues, unusual mileage, or other observations" disabled={Boolean(reportExisting && reportExisting.status !== 'Returned')} />
@@ -1633,7 +2144,7 @@ export default function FleetApp() {
                                 <span>{alert.message}</span>
                               </div>
                             ))}
-                            {reportDraft.condition !== 'Good' && <div className={'fleet-odometer-alert fleet-odometer-alert--' + (reportDraft.condition === 'Unsafe' ? 'error' : 'warning')}><ShieldAlert size={17} /><span>{reportDraft.condition === 'Unsafe' ? 'An unsafe condition will create or escalate a high-priority maintenance issue and place the vehicle on a service hold in the demo. Releasing it requires a separate review.' : 'A condition needing attention will generate a maintenance issue for follow-through.'}</span></div>}
+                            {reportDraft.condition !== 'Good' && <div className={'fleet-odometer-alert fleet-odometer-alert--' + (reportDraft.condition === 'Unsafe' ? 'error' : 'warning')}><ShieldAlert size={17} /><span>{reportDraft.condition === 'Unsafe' ? 'An unsafe condition will create or escalate a high-priority maintenance issue and place the vehicle on a service hold. Releasing it requires a separate authorized review.' : 'A condition needing attention will generate a maintenance issue for follow-through.'}</span></div>}
                           </div>
                         ) : null}
                         <div className="fleet-form-actions fleet-form__actions">
@@ -1675,12 +2186,12 @@ export default function FleetApp() {
                     </div>
                   </div>
                 )}
-                {reportsTab === 'review' && (
+                {reportsTab === 'review' && canReview && (
                   <FleetCard role="tabpanel" className="fleet-review-card">
                     <SectionTitle eyebrow="SUPERVISOR WORKFLOW" title="Pending approval" description={'Review submissions for ' + displayPeriod(period) + '. Approvals update the vehicle odometer and audit trail.'} action={<Tone tone="pending">{pendingReports.length} awaiting review</Tone>} />
                     <div className="fleet-reviewer-row">
                       <Field htmlFor="fleet-reviewer" label="Reviewer name">
-                        <input id="fleet-reviewer" className="fleet-input" value={reviewer} onChange={(event) => setReviewer(event.target.value)} maxLength={80} placeholder="Demo Supervisor" />
+                        <input id="fleet-reviewer" className="fleet-input" value={reviewer} onChange={(event) => setReviewer(event.target.value)} maxLength={80} readOnly={sharedMode} placeholder="Demo Supervisor" />
                       </Field>
                     </div>
                     {pendingReports.length ? (
@@ -1745,21 +2256,33 @@ export default function FleetApp() {
                                   <td><Tone tone={report.status.toLowerCase()}>{report.status}</Tone>{qualityIssues.length > 0 && <small className="fleet-table__meta fleet-urgency">{qualityIssues.length} data checks</small>}</td>
                                   <td><strong>v{report.revision}</strong><small className="fleet-table__meta">{getReportHistory(fleet, report.id).length} events</small></td>
                                   <td><div className="fleet-form-actions">
-                                    {report.status === 'Returned' && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => openReport(report.vehicleId)}>Correct <ArrowRight size={15} /></button>}
-                                    {report.status === 'Pending' && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => openReview(report.id)}>Review <ArrowRight size={15} /></button>}
+                                  {report.status === 'Returned' && canSubmit && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => openReport(report.vehicleId)}>Correct <ArrowRight size={15} /></button>}
+                                  {report.status === 'Pending' && canReview && <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" onClick={() => openReview(report.id)}>Review <ArrowRight size={15} /></button>}
                                     <button className="fleet-button fleet-button--small fleet-button--quiet" type="button" aria-expanded={expandedReportId === report.id} onClick={() => setExpandedReportId((current) => current === report.id ? null : report.id)}>
                                       <History size={15} /> {expandedReportId === report.id ? 'Hide history' : 'History'}
                                     </button>
                                   </div></td>
                                 </tr>
                                 {expandedReportId === report.id && <tr className="fleet-history-expanded"><td colSpan={7}>
-                                  {qualityIssues.length > 0 && <section className="fleet-quality-issues" aria-label="Report data-quality findings"><h4>Data-quality checks</h4><ul>{qualityIssues.map((issue, i) => <li key={i}>{issue}</li>)}</ul><p className="fleet-text-muted">Approved records are not edited silently. Reopening a record for correction retains this approved snapshot.</p><button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => {
-                                    setQuarterScope(fiscalQuarterForPeriod(report.period))
-                                    setQuarterQualityFilter('Quality')
-                                    setExpandedQualityVehicleId(report.vehicleId)
-                                    changePage('exports')
-                                    setFocusTarget('fleet-quarter-quality-' + report.vehicleId)
-                                  }}>Review correction options <ArrowRight size={14} /></button></section>}
+                                  {qualityIssues.length > 0 && <section className="fleet-quality-issues" aria-label="Report data-quality findings">
+                                    <h4>Data-quality checks</h4>
+                                    <ul>{qualityIssues.map((issue, i) => <li key={i}>{issue}</li>)}</ul>
+                                    <p className="fleet-text-muted">Approved records are not edited silently. Reopening a record for correction retains the prior approved snapshot.</p>
+                                    {canReview && report.status === 'Approved' && <button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => setCorrectionRequest({ reportId: report.id, vehicleId: report.vehicleId, period: report.period, reason: '' })}>Request correction <ArrowRight size={14} /></button>}
+                                    {canManageFleet && <button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => {
+                                      setQuarterScope(fiscalQuarterForPeriod(report.period))
+                                      setQuarterQualityFilter('Quality')
+                                      setExpandedQualityVehicleId(report.vehicleId)
+                                      changePage('exports')
+                                      setFocusTarget('fleet-quarter-quality-' + report.vehicleId)
+                                    }}>Quarterly quality matrix <ArrowRight size={14} /></button>}
+                                    {correctionRequest?.reportId === report.id && canReview && <form className="fleet-form fleet-quarterly-correction-form" onSubmit={submitApprovedCorrection}>
+                                      <Field htmlFor={'fleet-history-correction-' + report.id} label="Reason to reopen this approved report">
+                                        <textarea id={'fleet-history-correction-' + report.id} className="fleet-textarea" minLength={5} maxLength={400} required rows={3} value={correctionRequest.reason} onChange={(event) => setCorrectionRequest((current) => current ? { ...current, reason: event.target.value } : current)} placeholder="Explain which source evidence needs correction" />
+                                      </Field>
+                                      <div className="fleet-form-actions"><button type="submit" className="fleet-button fleet-button--primary" disabled={correctionRequest.reason.trim().length < 5}>Reopen for correction</button><button type="button" className="fleet-button fleet-button--quiet" onClick={() => setCorrectionRequest(null)}>Cancel</button></div>
+                                    </form>}
+                                  </section>}
                                   <ReportHistoryLedger entries={getReportHistory(fleet, report.id)} />
                                 </td></tr>}
                               </Fragment>
@@ -1778,7 +2301,7 @@ export default function FleetApp() {
               <>
                 {vehicleFormOpen && (
                   <FleetCard className="fleet-create-card">
-                    <SectionTitle eyebrow="DIRECTORY MANAGEMENT" title="Add a vehicle or campus asset" description="This adds a fictional record to your browser's demo fleet." action={<button type="button" className="fleet-icon-button" aria-label="Close new vehicle form" onClick={() => setVehicleFormOpen(false)}><X size={19} /></button>} />
+                    <SectionTitle eyebrow="DIRECTORY MANAGEMENT" title="Add a vehicle or campus asset" description={sharedMode ? 'Adds a server-stored vehicle record. No official campus asset register is connected.' : "Adds a fictional record to this browser's Demo fleet."} action={<button type="button" className="fleet-icon-button" aria-label="Close new vehicle form" onClick={() => setVehicleFormOpen(false)}><X size={19} /></button>} />
                     <form className="fleet-form" onSubmit={handleAddVehicle}>
                       <div className="fleet-form-grid fleet-form-grid--wide">
                         <Field htmlFor="fleet-new-unit" label="Unit ID"><input className="fleet-input" id="fleet-new-unit" value={vehicleDraft.unit} maxLength={40} required placeholder="DEMO-1001" onChange={(event) => setVehicleDraft((draft) => ({ ...draft, unit: event.target.value }))} /></Field>
@@ -1837,7 +2360,7 @@ export default function FleetApp() {
                           <MetaLine label={displayPeriod(period) + ' report'} value={activeReportFor(fleet, selectedVehicle.id, period) ? <Tone tone={activeReportFor(fleet, selectedVehicle.id, period)!.status.toLowerCase()}>{activeReportFor(fleet, selectedVehicle.id, period)!.status}</Tone> : <Tone tone="muted">Missing</Tone>} />
                           <MetaLine label="Service issues" value={fleet.tickets.filter((ticket) => ticket.vehicleId === selectedVehicle.id && ticket.status !== 'Resolved').length + ' open'} />
                         </div>
-                        <div className="fleet-vehicle-detail__actions"><button type="button" className="fleet-button fleet-button--primary" onClick={() => openReport(selectedVehicle.id)}><FileText size={16} /> Monthly report</button><button type="button" className="fleet-button fleet-button--quiet" onClick={() => openTicket(undefined, selectedVehicle.id)}><Wrench size={16} /> Raise issue</button><button type="button" className="fleet-button fleet-button--quiet" onClick={() => vehicleEditId === selectedVehicle.id ? setVehicleEditId(null) : beginVehicleEdit(selectedVehicle)} aria-expanded={vehicleEditId === selectedVehicle.id}><Pencil size={16} /> Edit vehicle</button></div>
+                        <div className="fleet-vehicle-detail__actions">{canSubmit && <button type="button" className="fleet-button fleet-button--primary" onClick={() => openReport(selectedVehicle.id)}><FileText size={16} /> Monthly report</button>}{canManageService && <button type="button" className="fleet-button fleet-button--quiet" onClick={() => openTicket(undefined, selectedVehicle.id)}><Wrench size={16} /> Raise issue</button>}{canManageFleet && <button type="button" className="fleet-button fleet-button--quiet" onClick={() => vehicleEditId === selectedVehicle.id ? setVehicleEditId(null) : beginVehicleEdit(selectedVehicle)} aria-expanded={vehicleEditId === selectedVehicle.id}><Pencil size={16} /> Edit vehicle</button>}</div>
                         <section className="fleet-vehicle-report-history" aria-label={'Monthly report versions for ' + selectedVehicle.unit}>
                           <div className="fleet-profile-form__heading"><h3>Monthly report versions</h3><span className="fleet-text-muted">Latest six months</span></div>
                           {fleet.reports.some((report) => report.vehicleId === selectedVehicle.id) ? (
@@ -1856,7 +2379,7 @@ export default function FleetApp() {
                             </div>
                           ) : <p className="fleet-text-muted">No monthly reports have been recorded for this vehicle.</p>}
                         </section>
-                        {vehicleEditId === selectedVehicle.id && (
+                        {vehicleEditId === selectedVehicle.id && canManageFleet && (
                           <form className="fleet-form fleet-vehicle-edit-form" onSubmit={handleVehicleEdit}>
                             <div className="fleet-profile-form__heading"><h3>Edit {selectedVehicle.unit} details</h3><button type="button" className="fleet-icon-button" aria-label="Cancel vehicle edit" onClick={() => setVehicleEditId(null)}><X size={18} /></button></div>
                             <div className="fleet-form-grid fleet-form-grid--wide">
@@ -1875,10 +2398,10 @@ export default function FleetApp() {
                             <div className="fleet-form-actions"><button type="submit" className="fleet-button fleet-button--primary"><Check size={16} /> Save vehicle details</button><button type="button" className="fleet-button fleet-button--quiet" onClick={() => setVehicleEditId(null)}>Cancel</button></div>
                           </form>
                         )}
-                        <section className="fleet-vehicle-status-actions" aria-label="Vehicle service status">
+                        {canManageFleet && <section className="fleet-vehicle-status-actions" aria-label="Vehicle service status">
                           <h3>Availability & service hold</h3>
                           <p className="fleet-text-muted">Status changes are logged in the local audit. Releasing a vehicle is a manual administrative action, separate from resolving repair tickets.</p>
-                          {selectedVehicle.status === 'In maintenance' && <div className="fleet-banner fleet-banner--warning"><ShieldAlert size={18} /><span>This unit is held out of service. Resolve high-priority issues before marking it active. Complete real-world safety release procedures outside this demo.</span></div>}
+                          {selectedVehicle.status === 'In maintenance' && <div className="fleet-banner fleet-banner--warning"><ShieldAlert size={18} /><span>This unit is held out of service. Resolve high-priority issues before marking it active. Complete real-world safety release procedures outside FleetSync.</span></div>}
                           <Field htmlFor="fleet-vehicle-status" label="New status"><select id="fleet-vehicle-status" className="fleet-select" value={vehicleStatusDraft} onChange={(event) => setVehicleStatusDraft(event.target.value as VehicleStatus)}>{(['Active', 'In maintenance', 'Retired'] as VehicleStatus[]).map((status) => <option key={status}>{status}</option>)}</select></Field>
                           {vehicleStatusDraft !== selectedVehicle.status && (
                             <>
@@ -1886,7 +2409,7 @@ export default function FleetApp() {
                               <button type="button" className="fleet-button fleet-button--primary" disabled={vehicleStatusNote.trim().length < 5} onClick={() => handleVehicleStatus(selectedVehicle)}><Check size={16} /> Save vehicle status</button>
                             </>
                           )}
-                        </section>
+                        </section>}
                       </>
                     ) : <Empty icon={Truck} title="Select a vehicle" description="Choose a unit from the directory to inspect its profile." />}
                   </FleetCard>
@@ -1898,12 +2421,40 @@ export default function FleetApp() {
               <>
                 <div className="fleet-grid fleet-maintenance-layout">
                   <FleetCard className="fleet-maintenance-card">
-                    <SectionTitle eyebrow="SERVICE WORKFLOW" title="Maintenance queue" description="Issues remain visible across reporting months. Department scope still applies." action={<Tone tone="medium">{filteredTickets.filter((ticket) => ticket.status !== 'Resolved').length} active</Tone>} />
+                    <SectionTitle eyebrow={role === 'Maintenance' ? 'TECHNICIAN WORKSPACE' : 'SERVICE WORKFLOW'} title={role === 'Maintenance' ? 'Assigned and open work orders' : 'Maintenance queue'} description="Filter by status, priority, assigned technician, or unit. Work orders retain their activity history." action={<Tone tone="medium">{filteredTickets.filter((ticket) => ticket.status !== 'Resolved').length} active</Tone>} />
+                    {role === 'Maintenance' && (
+                      <div className="fleet-role-summary fleet-role-summary--maintenance" data-testid="maintenance-workspace" aria-label="Technician work order status">
+                        <div className="fleet-role-summary__body"><span className="fleet-eyebrow">SHOP WORK QUEUE</span><strong>{filteredTickets.filter((ticket) => ticket.status === 'Open').length} open · {filteredTickets.filter((ticket) => ticket.status === 'Scheduled').length} scheduled</strong><span>Choose a work order to assign a technician, schedule service, or record a repair outcome. Service holds are released separately.</span></div>
+                        {canManageService && <button type="button" className="fleet-button fleet-button--primary fleet-button--small" onClick={() => {
+                          const first = visibleMaintenanceTickets.find((ticket) => ticket.status !== 'Resolved')
+                          if (first) openTicket(first.id)
+                          else setTicketFormOpen(true)
+                        }}>Open next work order <ArrowRight size={15} /></button>}
+                      </div>
+                    )}
                     <div className="fleet-tabs fleet-tabs--compact" role="group" aria-label="Filter maintenance status">
                       {(['Active', 'All', ...TICKET_STATUSES] as TicketFilter[]).map((status) => <button type="button" key={status} className={'fleet-tab ' + (ticketFilter === status ? 'is-active' : '')} aria-pressed={ticketFilter === status} onClick={() => setTicketFilter(status)}>{status}</button>)}
                     </div>
+                    <div className="fleet-work-filters" aria-label="Search and filter work orders">
+                      <Field htmlFor="fleet-work-search" label="Find work order">
+                        <input id="fleet-work-search" className="fleet-input" type="search" maxLength={120} value={workSearch} onChange={(event) => setWorkSearch(event.target.value)} placeholder="Search unit, issue, department or technician" />
+                      </Field>
+                      <Field htmlFor="fleet-work-priority" label="Priority">
+                        <select id="fleet-work-priority" className="fleet-select" value={workPriority} onChange={(event) => setWorkPriority(event.target.value as 'All' | Severity)}>
+                          <option value="All">All priorities</option>{SEVERITIES.map((value) => <option key={value}>{value}</option>)}
+                        </select>
+                      </Field>
+                      <Field htmlFor="fleet-work-assignment" label="Assigned">
+                        <select id="fleet-work-assignment" className="fleet-select" value={workAssignment} onChange={(event) => setWorkAssignment(event.target.value as 'All' | 'Mine' | 'Unassigned')}>
+                          <option value="All">All technicians</option>
+                          {sharedMode && <option value="Mine">Assigned to me</option>}
+                          <option value="Unassigned">Unassigned</option>
+                        </select>
+                      </Field>
+                      <span className="fleet-work-filters__count">{visibleMaintenanceTickets.length} matching work orders</span>
+                    </div>
                     <div className="fleet-ticket-list">
-                      {filteredTickets.filter((ticket) => ticketFilter === 'All' || (ticketFilter === 'Active' ? ticket.status !== 'Resolved' : ticket.status === ticketFilter)).map((ticket) => {
+                      {visibleMaintenanceTickets.map((ticket) => {
                         const vehicle = fleet.vehicles.find((item) => item.id === ticket.vehicleId)
                         const daysOpen = elapsedDays(ticket.createdAt)
                         const serviceOverdue = ticket.status === 'Scheduled' && ticket.scheduledFor && ticket.scheduledFor < new Date().toISOString().slice(0, 10)
@@ -1922,11 +2473,11 @@ export default function FleetApp() {
                             {ticket.resolutionNote && <p className="fleet-ticket__resolution"><CheckCircle2 size={15} /> <span>Resolution: {ticket.resolutionNote}</span></p>}
                             <div className="fleet-ticket__bottom">
                               <Tone tone={ticket.status.toLowerCase()}>{ticket.status}</Tone>
-                              <button type="button" className="fleet-button fleet-button--small fleet-button--quiet" onClick={() => serviceEditId === ticket.id ? setServiceEditId(null) : beginServiceEdit(ticket)} aria-expanded={serviceEditId === ticket.id}><Settings2 size={16} /> {serviceEditId === ticket.id ? 'Close editor' : 'Update work'} <ChevronDown size={15} /></button>
+                              {canManageService && <button type="button" className="fleet-button fleet-button--small fleet-button--quiet" onClick={() => serviceEditId === ticket.id ? setServiceEditId(null) : beginServiceEdit(ticket)} aria-expanded={serviceEditId === ticket.id}><Settings2 size={16} /> {serviceEditId === ticket.id ? 'Close editor' : 'Update work'} <ChevronDown size={15} /></button>}
                               <button type="button" className="fleet-button fleet-button--small fleet-button--quiet" aria-expanded={expandedTicketHistoryId === ticket.id} onClick={() => setExpandedTicketHistoryId((id) => id === ticket.id ? null : ticket.id)}><History size={15} /> {expandedTicketHistoryId === ticket.id ? 'Hide activity' : 'Activity (' + getTicketHistory(fleet, ticket.id).length + ')'}</button>
-                              {ticket.sourceReportId && <button type="button" className="fleet-button fleet-button--small fleet-button--quiet" onClick={() => openReportHistory(ticket.sourceReportId!)}>Source report <ArrowRight size={14} /></button>}
+                              {ticket.sourceReportId && (canReview || canSubmit) && <button type="button" className="fleet-button fleet-button--small fleet-button--quiet" onClick={() => openReportHistory(ticket.sourceReportId!)}>Source report <ArrowRight size={14} /></button>}
                             </div>
-                            {serviceEditId === ticket.id && (
+                            {serviceEditId === ticket.id && canManageService && (
                               <form className="fleet-form fleet-maintenance-editor" onSubmit={(event) => handleServiceUpdate(event, ticket)}>
                                 <div className="fleet-maintenance-editor__heading"><h4>Service follow-through</h4><p>Changes are recorded in the local audit. A resolved ticket still requires an explicit administrative release from any vehicle service hold.</p></div>
                                 <div className="fleet-form-grid">
@@ -1944,18 +2495,18 @@ export default function FleetApp() {
                           </article>
                         )
                       })}
-                      {!filteredTickets.some((ticket) => ticketFilter === 'All' || (ticketFilter === 'Active' ? ticket.status !== 'Resolved' : ticket.status === ticketFilter)) && <Empty icon={CheckCircle2} title="No issues in this queue" description="No maintenance tickets match the selected status and department." />}
+                      {!visibleMaintenanceTickets.length && <Empty icon={CheckCircle2} title="No work orders match these filters" description={workAssignment === 'Mine' ? 'No work orders are assigned to your account by display name. Select All technicians to see the full permitted queue.' : 'Try another status, priority, assignee or search term.'} action={<button type="button" className="fleet-button fleet-button--quiet fleet-button--small" onClick={() => { setWorkAssignment('All'); setWorkSearch(''); setWorkPriority('All'); setTicketFilter('Active') }}>Clear work filters</button>} />}
                     </div>
                   </FleetCard>
                   <div className="fleet-stack">
-                    {ticketFormOpen && (
+                    {ticketFormOpen && canManageService && (
                       <FleetCard className="fleet-create-card">
                         <SectionTitle eyebrow="NEW SERVICE ISSUE" title="Create a maintenance ticket" action={<button type="button" className="fleet-icon-button" aria-label="Close maintenance issue form" onClick={() => setTicketFormOpen(false)}><X size={19} /></button>} />
                         <form id="fleet-new-ticket-form" tabIndex={-1} className="fleet-form fleet-record-anchor" onSubmit={handleAddTicket}>
                           <Field label="Vehicle" htmlFor="fleet-new-ticket-vehicle"><select className="fleet-select" id="fleet-new-ticket-vehicle" value={ticketDraft.vehicleId} required onChange={(event) => setTicketDraft((draft) => ({ ...draft, vehicleId: event.target.value }))}>{filteredVehicles.map((vehicle) => <option key={vehicle.id} value={vehicle.id}>{vehicle.unit} · {vehicle.make} {vehicle.model}</option>)}</select></Field>
                           <Field label="Issue title" htmlFor="fleet-new-ticket-title"><input className="fleet-input" id="fleet-new-ticket-title" maxLength={100} required value={ticketDraft.title} placeholder="e.g. Brake system inspection" onChange={(event) => setTicketDraft((draft) => ({ ...draft, title: event.target.value }))} /></Field>
                           <Field label="Severity" htmlFor="fleet-new-ticket-severity"><select className="fleet-select" id="fleet-new-ticket-severity" value={ticketDraft.severity} onChange={(event) => setTicketDraft((draft) => ({ ...draft, severity: event.target.value as Severity }))}>{SEVERITIES.map((severity) => <option key={severity}>{severity}</option>)}</select></Field>
-                          <Field label="Assigned to (optional)" htmlFor="fleet-new-ticket-assignee"><input className="fleet-input" id="fleet-new-ticket-assignee" maxLength={80} value={ticketDraft.assignee} placeholder="Demo garage team" onChange={(event) => setTicketDraft((draft) => ({ ...draft, assignee: event.target.value }))} /></Field>
+                          <Field label="Assigned to (optional)" htmlFor="fleet-new-ticket-assignee"><input className="fleet-input" id="fleet-new-ticket-assignee" maxLength={80} value={ticketDraft.assignee} placeholder="Garage team or technician" onChange={(event) => setTicketDraft((draft) => ({ ...draft, assignee: event.target.value }))} /></Field>
                           <Field label="Description" htmlFor="fleet-new-ticket-description"><textarea className="fleet-textarea" id="fleet-new-ticket-description" rows={4} maxLength={1200} required value={ticketDraft.description} placeholder="Describe the issue, symptoms and follow-up needed" onChange={(event) => setTicketDraft((draft) => ({ ...draft, description: event.target.value }))} /></Field>
                           <div className="fleet-form-actions fleet-form__actions"><button type="submit" className="fleet-button fleet-button--primary"><Plus size={17} /> Create issue</button></div>
                         </form>
@@ -1969,19 +2520,19 @@ export default function FleetApp() {
                         <div><span className="fleet-ticket-counts__dot fleet-ticket-counts__dot--resolved" /><strong>{filteredTickets.filter((ticket) => ticket.status === 'Resolved').length}</strong><small>Resolved</small></div>
                       </div>
                       <p className="fleet-text-muted">A reported vehicle condition requiring attention automatically creates a service ticket when one is not already active for that report.</p>
-                      {!ticketFormOpen && <button type="button" className="fleet-button fleet-button--quiet fleet-button--block" onClick={() => { setTicketDraft(blankTicketDraft(filteredVehicles[0]?.id)); setTicketFormOpen(true) }}><Plus size={16} /> Log a service issue</button>}
+                      {!ticketFormOpen && canManageService && <button type="button" className="fleet-button fleet-button--quiet fleet-button--block" onClick={() => { setTicketDraft(blankTicketDraft(filteredVehicles[0]?.id)); setTicketFormOpen(true) }}><Plus size={16} /> Log a service issue</button>}
                     </FleetCard>
                     <FleetCard className="fleet-warning-card">
-                      <h3>Service holds and safety reports</h3><p>Unsafe driver reports generate a high-priority work order and set a demo service hold. Resolving the work order does not automatically release the vehicle. Real safety decisions remain outside this prototype.</p>
+                      <h3>Service holds and safety reports</h3><p>Unsafe driver reports generate a high-priority work order and place a service hold. Resolving the work order does not automatically release the vehicle. Real safety decisions require separate institutional procedures.</p>
                     </FleetCard>
                   </div>
                 </div>
               </>
             )}
 
-            {view === 'exports' && (
+            {view === 'exports' && canManageFleet && (
               <>
-                <div className="fleet-banner fleet-banner--warning fleet-export-disclaimer"><AlertTriangle size={21} /><div><strong>Internal review staging only. No state submission.</strong><p>Monthly and fiscal quarterly CSV worksheets are fictional administrative reconciliation aids. They are not validated TxFS batch layouts, have not been certified by Texas OVFM, and are never transmitted to state systems.</p></div></div>
+                <div className="fleet-banner fleet-banner--warning fleet-export-disclaimer"><AlertTriangle size={21} /><div><strong>Internal review staging only. No state submission.</strong><p>Monthly and fiscal quarterly CSV worksheets are administrative reconciliation aids. They are not validated TxFS batch layouts, have not been certified by Texas OVFM, and are never transmitted to state systems.</p></div></div>
                 <FleetCard className="fleet-quarterly-panel">
                   <SectionTitle
                     eyebrow="FISCAL QUARTER RECONCILIATION"
@@ -1989,7 +2540,7 @@ export default function FleetApp() {
                     description="Texas-style fiscal quarters run September–November, December–February, March–May, and June–August. Only licensed vehicles are counted in this staging review."
                     action={<Tone tone={quarterData.completion === 100 ? 'approved' : 'pending'}>{fiscalQuarterLabel(quarterScope.fiscalYear, quarterScope.quarter)}</Tone>}
                   />
-                  <p className="fleet-text-muted fleet-quarterly-current-note">In-progress quarters may show missing months that are not yet overdue. Department monthly due dates are fictional demo settings and separate from the state's quarterly submission window.</p>
+                  <p className="fleet-text-muted fleet-quarterly-current-note">In-progress quarters may show missing months that are not yet overdue. Department monthly due dates are configurable local settings and separate from the state's quarterly submission window.</p>
                   <div className="fleet-quarterly-controls">
                     <Field label="Fiscal year" htmlFor="fleet-quarter-year">
                       <select id="fleet-quarter-year" className="fleet-select" value={quarterScope.fiscalYear} onChange={(event) => setQuarterScope((previous) => ({ ...previous, fiscalYear: Number(event.target.value) }))}>
@@ -2076,7 +2627,7 @@ export default function FleetApp() {
                                 </li>)}</ol>
                                 {correctionRequest?.vehicleId === row.vehicle.id && (
                                   <form className="fleet-form fleet-quarterly-correction-form" onSubmit={submitApprovedCorrection}>
-                                    <Field htmlFor={'fleet-quarter-correction-' + row.vehicle.id} label="Reason for reopening approved record (required)" hint={'This changes ' + displayPeriod(correctionRequest.period) + ' to Returned in the local demo and keeps the approved version in the history ledger.'}>
+                                    <Field htmlFor={'fleet-quarter-correction-' + row.vehicle.id} label="Reason for reopening approved record (required)" hint={'This changes ' + displayPeriod(correctionRequest.period) + ' to Returned and keeps the approved version in the history ledger.'}>
                                       <textarea id={'fleet-quarter-correction-' + row.vehicle.id} className="fleet-textarea" rows={3} minLength={5} maxLength={400} required value={correctionRequest.reason} onChange={(event) => setCorrectionRequest((current) => current ? { ...current, reason: event.target.value } : current)} placeholder="Describe the missing evidence, incorrect source attribution, or other data issue" />
                                     </Field>
                                     <div className="fleet-form-actions">
@@ -2125,7 +2676,7 @@ export default function FleetApp() {
                   {!exportRecords.length && <Empty icon={FileSpreadsheet} title="No export-ready records" description="Only approved monthly reports for licensed vehicles will appear here." action={<button type="button" className="fleet-button fleet-button--quiet" onClick={() => { setReportsTab('review'); changePage('reports') }}>Review reports <ArrowRight size={16} /></button>} />}
                 </FleetCard>
                 <FleetCard className="fleet-audit-card">
-                  <SectionTitle eyebrow="TRACEABILITY" title="Activity & audit log" description="Locally recorded demo actions. This log is illustrative and has no tamper protection or server validation." action={<Tone tone="muted">{auditEntries.length} entries</Tone>} />
+                  <SectionTitle eyebrow="TRACEABILITY" title="Activity & audit log" description={sharedMode ? 'Authenticated local server activity history. This is not a tamper-proof or certified institutional audit system.' : 'Browser-local demo activity. This log is illustrative and has no tamper protection or server validation.'} action={<Tone tone="muted">{auditEntries.length} entries</Tone>} />
                   <div className="fleet-search fleet-audit-search"><Search size={18} /><label className="fleet-sr-only" htmlFor="fleet-audit-search">Search audit activity</label><input id="fleet-audit-search" className="fleet-input" type="search" placeholder="Search actions, actors, and details..." value={auditSearch} onChange={(event) => setAuditSearch(event.target.value)} /></div>
                   <div className="fleet-audit-list">
                     {auditEntries.map((entry) => (

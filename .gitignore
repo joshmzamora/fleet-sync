@@ -6,3 +6,7 @@ dist/
 playwright-report/
 test-results/
 .screenshots/
+.local-data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
