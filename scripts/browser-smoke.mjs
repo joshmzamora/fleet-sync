@@ -18,7 +18,7 @@ try {
   browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || 'chrome', headless: true })
   const desktop = await browser.newPage({ viewport: { width: 1365, height: 850 } })
   await checkPageErrors(desktop, async () => {
-    await desktop.goto('http://127.0.0.1:4179/', { waitUntil: 'domcontentloaded' })
+    await desktop.goto('http://127.0.0.1:4179/campus-map', { waitUntil: 'domcontentloaded' })
     await desktop.locator('.leaflet-container').waitFor()
     assert.ok(await desktop.locator('.leaflet-container').isVisible(), 'Interactive map missing')
     assert.ok(await desktop.getByRole('tab', { name: /Locations/ }).isVisible(), 'Locations tab missing')
@@ -55,7 +55,7 @@ try {
 
   const mobile = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true })
   await checkPageErrors(mobile, async () => {
-    await mobile.goto('http://127.0.0.1:4179/', { waitUntil: 'domcontentloaded' })
+    await mobile.goto('http://127.0.0.1:4179/campus-map', { waitUntil: 'domcontentloaded' })
     const mapBox = await mobile.locator('.leaflet-container').boundingBox()
     assert.ok(mapBox && mapBox.width >= 360, 'Map should fill phone width')
     const menu = mobile.getByRole('button', { name: /Open locations menu/ }).first()
